@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-patch-verifier:evidence-plan:1",
+  "title": "Agent Patch Verifier evidence plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "requirements", "cases"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "statement",
+          "kind",
+          "provenance",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "statement": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "kind": {
+            "enum": ["requested", "preservation"]
+          },
+          "provenance": {
+            "enum": ["explicit", "preexisting", "inferred"]
+          },
+          "source": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "excerpt": {
+            "type": ["string", "null"]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "provenance": {
+                  "const": "explicit"
+                }
+              },
+              "required": ["provenance"]
+            },
+            "then": {
+              "required": ["excerpt"],
+              "properties": {
+                "source": {
+                  "pattern": "^[iI][sS][sS][uU][eE](?:\\.[mM][dD])?:[1-9][0-9]*$"
+                },
+                "excerpt": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "provenance": {
+                  "const": "preexisting"
+                }
+              },
+              "required": ["provenance"]
+            },
+            "then": {
+              "required": ["excerpt"],
+              "properties": {
+                "source": {
+                  "pattern": "^.+:0*[1-9][0-9]*$"
+                },
+                "excerpt": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "requirement_id", "test_file", "node"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "requirement_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "test_file": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\.py$"
+          },
+          "node": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$"
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
+
