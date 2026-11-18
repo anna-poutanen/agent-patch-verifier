@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -22,6 +22,14 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _PLAN_KEYS = {"schema_version", "requirements", "cases"}
 _REQUIREMENT_KEYS = {"id", "statement", "kind", "provenance", "source", "excerpt"}
 _CASE_KEYS = {"id", "requirement_id", "test_file", "node", "rationale"}
+_MAX_REQUIREMENTS = 200
+_MAX_CASES = 50
+_MAX_ID_LENGTH = 64
+_MAX_PLAN_DOCUMENT_BYTES = 5 * 1024 * 1024
+_MAX_CANDIDATE_FILE_BYTES = 2 * 1024 * 1024
+_MAX_TOTAL_CANDIDATE_BYTES = 20 * 1024 * 1024
+_MAX_BASE_SOURCE_FILE_BYTES = 2 * 1024 * 1024
+_MAX_TOTAL_BASE_SOURCE_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -33,10 +41,13 @@ class CandidateCase:
     source_file: Path
     node: str
     rationale: str
+    source_bytes: bytes = field(repr=False)
 
     @property
     def source_sha256(self) -> str:
-        return hashlib.sha256(self.source_file.read_bytes()).hexdigest()
+        """Hash the exact bytes parsed and later injected by the verifier."""
+
+        return hashlib.sha256(self.source_bytes).hexdigest()
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -66,7 +77,12 @@ class EvidencePlan:
         }
 
 
-def load_evidence_plan(path: Path, *, issue_text: str) -> EvidencePlan:
+def load_evidence_plan(
+    path: Path,
+    *,
+    issue_text: str,
+    document_bytes: bytes | None = None,
+) -> EvidencePlan:
     """Load and validate a JSON evidence plan.
 
     Candidate paths are resolved relative to the plan file. Explicit
@@ -76,10 +92,19 @@ def load_evidence_plan(path: Path, *, issue_text: str) -> EvidencePlan:
 
     plan_path = path.resolve()
     try:
-        raw = json.loads(plan_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise PlanError(f"cannot read evidence plan {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+        if document_bytes is None:
+            document_bytes = _read_bounded_bytes(
+                plan_path,
+                max_bytes=_MAX_PLAN_DOCUMENT_BYTES,
+                label=f"evidence plan {path}",
+            )
+        elif len(document_bytes) > _MAX_PLAN_DOCUMENT_BYTES:
+            raise PlanError(
+                "evidence plan exceeds the "
+                f"{_MAX_PLAN_DOCUMENT_BYTES}-byte limit"
+            )
+        raw = json.loads(document_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PlanError(f"evidence plan is not valid JSON: {exc}") from exc
     if not isinstance(raw, Mapping):
         raise PlanError("evidence plan must be a JSON object")
@@ -90,10 +115,15 @@ def load_evidence_plan(path: Path, *, issue_text: str) -> EvidencePlan:
     if isinstance(schema_version, bool) or schema_version != 1:
         raise PlanError("evidence plan schema_version must be 1")
 
-    requirement_items = _object_list(raw, "requirements")
-    case_items = _object_list(raw, "cases")
+    requirement_items = _object_list(
+        raw, "requirements", max_items=_MAX_REQUIREMENTS
+    )
+    case_items = _object_list(raw, "cases", max_items=_MAX_CASES)
     requirements = tuple(_requirement(item) for item in requirement_items)
-    cases = tuple(_case(item, plan_path.parent) for item in case_items)
+    source_cache: dict[Path, bytes] = {}
+    cases = tuple(
+        _case(item, plan_path.parent, source_cache) for item in case_items
+    )
 
     _require_unique((item.id for item in requirements), "requirement")
     _require_unique((item.id for item in cases), "case")
@@ -137,6 +167,8 @@ def verify_base_sources(plan: EvidencePlan, base_root: Path) -> None:
     """
 
     resolved_root = base_root.resolve()
+    source_cache: dict[Path, str] = {}
+    total_source_bytes = 0
     for requirement in plan.requirements:
         if requirement.provenance is not ProvenanceTier.PREEXISTING:
             continue
@@ -153,12 +185,30 @@ def verify_base_sources(plan: EvidencePlan, base_root: Path) -> None:
             raise PlanError(
                 f"requirement {requirement.id!r} base source escapes the base tree"
             ) from exc
-        try:
-            contents = full_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise PlanError(
-                f"cannot verify source for requirement {requirement.id!r}: {exc}"
-            ) from exc
+        contents = source_cache.get(full_path)
+        if contents is None:
+            source_bytes = _read_bounded_bytes(
+                full_path,
+                max_bytes=_MAX_BASE_SOURCE_FILE_BYTES,
+                label=f"base source for requirement {requirement.id!r}",
+            )
+            if (
+                total_source_bytes + len(source_bytes)
+                > _MAX_TOTAL_BASE_SOURCE_BYTES
+            ):
+                raise PlanError(
+                    "cited base source files exceed the "
+                    f"{_MAX_TOTAL_BASE_SOURCE_BYTES}-byte aggregate limit"
+                )
+            try:
+                contents = source_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PlanError(
+                    f"base source for requirement {requirement.id!r} "
+                    "must be UTF-8 text"
+                ) from exc
+            source_cache[full_path] = contents
+            total_source_bytes += len(source_bytes)
         if not _excerpt_occurs_at_line(
             contents, requirement.excerpt or "", source_line
         ):
@@ -168,10 +218,14 @@ def verify_base_sources(plan: EvidencePlan, base_root: Path) -> None:
             )
 
 
-def _object_list(raw: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+def _object_list(
+    raw: Mapping[str, Any], key: str, *, max_items: int
+) -> list[Mapping[str, Any]]:
     value = raw.get(key)
     if not isinstance(value, list):
         raise PlanError(f"{key} must be a JSON array")
+    if len(value) > max_items:
+        raise PlanError(f"{key} must contain at most {max_items} entries")
     result: list[Mapping[str, Any]] = []
     for index, item in enumerate(value):
         if not isinstance(item, Mapping):
@@ -196,10 +250,18 @@ def _requirement(raw: Mapping[str, Any]) -> Requirement:
         raise PlanError(f"invalid requirement: {exc}") from exc
     if not _ID_RE.fullmatch(requirement.id):
         raise PlanError(f"invalid requirement id: {requirement.id!r}")
+    if len(requirement.id) > _MAX_ID_LENGTH:
+        raise PlanError(
+            f"requirement id must contain at most {_MAX_ID_LENGTH} characters"
+        )
     return requirement
 
 
-def _case(raw: Mapping[str, Any], plan_root: Path) -> CandidateCase:
+def _case(
+    raw: Mapping[str, Any],
+    plan_root: Path,
+    source_cache: dict[Path, bytes],
+) -> CandidateCase:
     unknown = set(raw) - _CASE_KEYS
     if unknown:
         raise PlanError(f"invalid case: unknown fields {sorted(unknown)}")
@@ -220,6 +282,10 @@ def _case(raw: Mapping[str, Any], plan_root: Path) -> CandidateCase:
         raise PlanError("case id must not be empty")
     if not _ID_RE.fullmatch(case_id):
         raise PlanError(f"invalid case id: {case_id!r}")
+    if len(case_id) > _MAX_ID_LENGTH:
+        raise PlanError(
+            f"case id must contain at most {_MAX_ID_LENGTH} characters"
+        )
     if not requirement_id:
         raise PlanError(f"case {case_id!r} requirement_id must not be empty")
     if not _NODE_RE.fullmatch(node):
@@ -234,12 +300,46 @@ def _case(raw: Mapping[str, Any], plan_root: Path) -> CandidateCase:
         raise PlanError(
             f"case {case_id!r} test file must be inside the evidence-plan directory"
         ) from exc
-    if not source_file.is_file():
-        raise PlanError(f"case {case_id!r} test file does not exist: {source_value}")
     if source_file.suffix != ".py":
         raise PlanError(f"case {case_id!r} test file must end in .py")
-    _verify_single_assertion(case_id, source_file, node)
-    return CandidateCase(case_id, requirement_id, source_file, node, rationale)
+    source_bytes = source_cache.get(source_file)
+    if source_bytes is None:
+        source_bytes = _read_bounded_bytes(
+            source_file,
+            max_bytes=_MAX_CANDIDATE_FILE_BYTES,
+            label=f"case {case_id!r} test file {source_value!r}",
+        )
+        total_candidate_bytes = sum(
+            len(contents) for contents in source_cache.values()
+        ) + len(source_bytes)
+        if total_candidate_bytes > _MAX_TOTAL_CANDIDATE_BYTES:
+            raise PlanError(
+                "candidate test files exceed the "
+                f"{_MAX_TOTAL_CANDIDATE_BYTES}-byte aggregate limit"
+            )
+        source_cache[source_file] = source_bytes
+    _verify_single_assertion(case_id, source_file, node, source_bytes)
+    return CandidateCase(
+        case_id,
+        requirement_id,
+        source_file,
+        node,
+        rationale,
+        source_bytes,
+    )
+
+
+def _read_bounded_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
+    """Read one local artifact without allocating beyond its byte budget."""
+
+    try:
+        with path.open("rb") as stream:
+            contents = stream.read(max_bytes + 1)
+    except OSError as exc:
+        raise PlanError(f"cannot read {label}: {exc}") from exc
+    if len(contents) > max_bytes:
+        raise PlanError(f"{label} exceeds the {max_bytes}-byte limit")
+    return contents
 
 
 def _require_unique(values: object, label: str) -> None:
@@ -263,15 +363,18 @@ def _require_unique_case_nodes(cases: tuple[CandidateCase, ...]) -> None:
         seen[key] = case.id
 
 
-def _verify_single_assertion(case_id: str, source_file: Path, node: str) -> None:
+def _verify_single_assertion(
+    case_id: str,
+    source_file: Path,
+    node: str,
+    source_bytes: bytes,
+) -> None:
     """Keep one candidate node attributable to one explicit assertion."""
 
     try:
-        tree = ast.parse(
-            source_file.read_text(encoding="utf-8"),
-            filename=str(source_file),
-        )
-    except (OSError, UnicodeError, SyntaxError) as exc:
+        source = source_bytes.decode("utf-8")
+        tree = ast.parse(source, filename=str(source_file))
+    except (UnicodeError, SyntaxError) as exc:
         raise PlanError(f"case {case_id!r} test file is not valid Python: {exc}") from exc
 
     scope: ast.AST = tree

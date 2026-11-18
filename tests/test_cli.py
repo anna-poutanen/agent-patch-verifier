@@ -6,6 +6,16 @@ import pytest
 from patch_verifier import cli
 
 
+def test_cli_reports_package_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["--version"])
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out == "apv 0.2.0\n"
+
+
 def test_cli_exits_two_when_execution_is_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

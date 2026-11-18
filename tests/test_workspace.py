@@ -266,3 +266,22 @@ def test_rejects_ambiguous_or_empty_patch_sources(
                 patch_text=patch_text,
                 patch_file=patch_file,
             )
+
+
+@pytest.mark.parametrize("source", ["text", "file"])
+def test_rejects_oversized_patch_before_repository_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    monkeypatch.setattr(PatchWorkspace, "_MAX_PATCH_BYTES", len(PATCH) - 1)
+    patch_file = tmp_path / "oversized.diff"
+    patch_file.write_bytes(PATCH)
+    arguments = (
+        {"patch_text": PATCH}
+        if source == "text"
+        else {"patch_file": patch_file}
+    )
+
+    workspace = PatchWorkspace(tmp_path / "missing-repository", "HEAD", **arguments)
+
+    with pytest.raises(PatchSourceError, match="exceeds"):
+        workspace.__enter__()

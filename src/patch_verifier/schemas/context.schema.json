@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-patch-verifier:context:1",
+  "title": "Agent Patch Verifier repository context",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "base", "patched", "summary"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "base": {"$ref": "#/$defs/baseSnapshot"},
+    "patched": {"$ref": "#/$defs/patchedSnapshot"},
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base", "patched"],
+      "properties": {
+        "base": {"$ref": "#/$defs/counts"},
+        "patched": {"$ref": "#/$defs/counts"}
+      }
+    }
+  },
+  "$defs": {
+    "baseSnapshot": {
+      "allOf": [
+        {"$ref": "#/$defs/snapshot"},
+        {"properties": {"revision": {"const": "base"}}}
+      ]
+    },
+    "patchedSnapshot": {
+      "allOf": [
+        {"$ref": "#/$defs/snapshot"},
+        {"properties": {"revision": {"const": "patched"}}}
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis",
+        "revision",
+        "symbols",
+        "diagnostics",
+        "limitations"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "analysis": {"const": "static"},
+        "revision": {"enum": ["base", "patched"]},
+        "symbols": {
+          "type": "array",
+          "maxItems": 200,
+          "$comment": "Runtime validation also limits the total number of items across all symbols to 500 per snapshot.",
+          "items": {"$ref": "#/$defs/symbol"}
+        },
+        "diagnostics": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/diagnostic"}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "symbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "qualified_name",
+        "kind",
+        "analyzed_path",
+        "base_path",
+        "patched_path",
+        "base_occurrence",
+        "patched_occurrence",
+        "revision_match",
+        "items",
+        "limitations"
+      ],
+      "properties": {
+        "path": {"type": "string"},
+        "qualified_name": {"type": "string"},
+        "kind": {"type": "string"},
+        "analyzed_path": {"type": ["string", "null"]},
+        "base_path": {"type": ["string", "null"]},
+        "patched_path": {"type": ["string", "null"]},
+        "base_occurrence": {"type": ["integer", "null"], "minimum": 1},
+        "patched_occurrence": {"type": ["integer", "null"], "minimum": 1},
+        "revision_match": {"type": "string"},
+        "items": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {"$ref": "#/$defs/item"}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Runtime validation also requires end_line to be greater than or equal to start_line.",
+      "required": [
+        "kind",
+        "path",
+        "start_line",
+        "end_line",
+        "symbol",
+        "excerpt",
+        "excerpt_truncated",
+        "score",
+        "rank",
+        "selection_reasons"
+      ],
+      "properties": {
+        "kind": {
+          "enum": ["signature", "docstring", "import", "caller", "nearby_test"]
+        },
+        "path": {"type": "string"},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "symbol": {"type": ["string", "null"]},
+        "excerpt": {"type": "string"},
+        "excerpt_truncated": {"type": "boolean"},
+        "score": {"type": "integer"},
+        "rank": {"type": "integer", "minimum": 1},
+        "selection_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/reason"}
+        }
+      }
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail", "weight"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "detail": {"type": "string", "minLength": 1},
+        "weight": {"type": "integer"}
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "path", "message", "line"],
+      "properties": {
+        "code": {"type": "string"},
+        "path": {"type": "string"},
+        "message": {"type": "string"},
+        "line": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbols",
+        "items",
+        "diagnostics",
+        "limitations",
+        "selection_reasons"
+      ],
+      "properties": {
+        "symbols": {"type": "integer", "minimum": 0},
+        "items": {"type": "integer", "minimum": 0},
+        "diagnostics": {"type": "integer", "minimum": 0},
+        "limitations": {"type": "integer", "minimum": 0},
+        "selection_reasons": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

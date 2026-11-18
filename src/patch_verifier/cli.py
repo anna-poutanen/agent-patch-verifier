@@ -8,6 +8,7 @@ import shlex
 import sys
 from typing import Sequence
 
+from . import __version__
 from .plan import PlanError
 from .verifier import (
     VerificationError,
@@ -26,6 +27,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run requirement-linked pytest evidence against base and patched revisions."
         ),
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     verify_parser = subparsers.add_parser(

@@ -88,6 +88,7 @@ class PatchWorkspace(AbstractContextManager["PatchWorkspace"]):
 
     _PREFIX = "patch-verifier-"
     _GIT_TIMEOUT_SECONDS = 60.0
+    _MAX_PATCH_BYTES = 20 * 1024 * 1024
     _GIT_REPOSITORY_ENVIRONMENT = (
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -270,12 +271,17 @@ class PatchWorkspace(AbstractContextManager["PatchWorkspace"]):
         else:
             assert self._patch_file is not None
             try:
-                patch = self._patch_file.read_bytes()
+                with self._patch_file.open("rb") as stream:
+                    patch = stream.read(self._MAX_PATCH_BYTES + 1)
             except OSError as error:
                 raise PatchSourceError(
                     f"cannot read patch file {self._patch_file}: {error.strerror or error}"
                 ) from error
 
+        if len(patch) > self._MAX_PATCH_BYTES:
+            raise PatchSourceError(
+                f"the supplied patch exceeds the {self._MAX_PATCH_BYTES}-byte limit"
+            )
         if not patch.strip():
             raise PatchSourceError("the supplied patch is empty")
         return patch

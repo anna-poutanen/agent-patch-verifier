@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 
 PYTHONHASHSEED = "0"
 _TIMEOUT_CLEANUP_SECONDS = 0.25
-OUTPUT_LIMIT_BYTES = 1_000_000
+OUTPUT_LIMIT_BYTES = 250_000
 _REPOSITORY_ENVIRONMENT = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -127,7 +127,7 @@ class TestCommand:
             result = (
                 *result,
                 "--runxfail",
-                f"--junitxml={os.fspath(self.junit_xml_path)}",
+                f"--junitxml={self.junit_xml_path.as_posix()}",
             )
         if self.test_path is not None:
             result = (*result, os.fspath(self.test_path))
