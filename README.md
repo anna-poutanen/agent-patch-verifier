@@ -1,5 +1,7 @@
 # Agent Patch Verifier
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Agent Patch Verifier (`apv`) is an evidence-first patch falsifier for Python
 projects. It executes the same requirement-linked pytest case against a base
 commit and a proposed patch, then reports only conclusions supported by both
@@ -295,6 +297,10 @@ sharing: project data or secrets printed by tests can be present even though
 captured streams are size-bounded. Fresh Git worktrees isolate repository files,
 not writes to the user home directory, network, databases, or other external
 systems.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the next implementation stages.
 
