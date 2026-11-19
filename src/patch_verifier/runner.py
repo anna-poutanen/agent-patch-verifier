@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 
 PYTHONHASHSEED = "0"
 _TIMEOUT_CLEANUP_SECONDS = 0.25
+_PIPE_DRAIN_SECONDS = 0.5
 OUTPUT_LIMIT_BYTES = 250_000
 _REPOSITORY_ENVIRONMENT = (
     "GIT_DIR",
@@ -506,33 +507,22 @@ def _finish_captures(
     descriptors.  Waiting the full budget for stdout and then again for stderr
     makes timeout handling scale with the number of pipes.  Worse, closing a
     buffered pipe whose reader thread is blocked can itself wait for that
-    descendant on some POSIX systems.  Use shared deadlines and leave any
+    descendant on some POSIX systems.  Use one shared deadline and leave any
     still-blocked daemon reader to observe EOF later instead.
     """
 
-    deadline = time.monotonic() + _TIMEOUT_CLEANUP_SECONDS
+    deadline = time.monotonic() + _PIPE_DRAIN_SECONDS
     for _pipe, thread, _capture in captures:
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
-
-    blocked = tuple(item for item in captures if item[1].is_alive())
-    for pipe, _thread, capture in blocked:
-        capture.truncated = True
-        if pipe is not None:
-            try:
-                os.close(pipe.fileno())
-            except (OSError, ValueError):
-                pass
-
-    deadline = time.monotonic() + _TIMEOUT_CLEANUP_SECONDS
-    for _pipe, thread, _capture in blocked:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     for pipe, thread, capture in captures:
         if thread.is_alive():
             capture.truncated = True
-            # ``pipe.close()`` may block on the buffered reader lock held by
-            # this thread.  The daemon owns the pipe until its escaped writer
-            # exits, at which point the closure is reclaimed normally.
+            # Closing a descriptor from another thread can block on the
+            # buffered reader and can let the descriptor number be reused
+            # while that reader still owns it. The daemon retains the pipe
+            # until its escaped writer exits; OS isolation is required to
+            # contain a descendant that deliberately never does.
             continue
         if pipe is not None:
             try:

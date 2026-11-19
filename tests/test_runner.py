@@ -4,8 +4,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
+import patch_verifier.runner as runner_module
 from patch_verifier.runner import (
     CommandStatus,
     OUTPUT_LIMIT_BYTES,
@@ -24,6 +27,23 @@ from patch_verifier.runner import (
 
 
 class RunnerTests(unittest.TestCase):
+    def test_capture_finishing_within_shared_drain_budget_is_not_truncated(
+        self,
+    ) -> None:
+        capture = runner_module._OutputCapture()
+        thread = threading.Thread(
+            target=lambda: time.sleep(
+                runner_module._PIPE_DRAIN_SECONDS * 0.6
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        runner_module._finish_captures(((None, thread, capture),))
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(capture.truncated)
+
     def test_captures_command_evidence_and_appends_test_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
