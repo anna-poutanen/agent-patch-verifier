@@ -389,8 +389,12 @@ def _run_once(
         except subprocess.TimeoutExpired:
             _terminate_process(process)
             _bounded_process_wait(process)
-            _finish_capture(process.stdout, stdout_thread, stdout_capture)
-            _finish_capture(process.stderr, stderr_thread, stderr_capture)
+            _finish_captures(
+                (
+                    (process.stdout, stdout_thread, stdout_capture),
+                    (process.stderr, stderr_thread, stderr_capture),
+                )
+            )
             return _result(
                 target,
                 attempt,
@@ -403,8 +407,12 @@ def _run_once(
                 stdout_truncated=stdout_capture.truncated,
                 stderr_truncated=stderr_capture.truncated,
             )
-        _finish_capture(process.stdout, stdout_thread, stdout_capture)
-        _finish_capture(process.stderr, stderr_thread, stderr_capture)
+        _finish_captures(
+            (
+                (process.stdout, stdout_thread, stdout_capture),
+                (process.stderr, stderr_thread, stderr_capture),
+            )
+        )
         exit_code = process.returncode
         status = (
             classify_exit_code(exit_code)
@@ -489,25 +497,48 @@ def _capture_pipe(
     return capture, thread
 
 
-def _finish_capture(
-    pipe: BinaryIO | None,
-    thread: threading.Thread,
-    capture: _OutputCapture,
+def _finish_captures(
+    captures: Sequence[tuple[BinaryIO | None, threading.Thread, _OutputCapture]],
 ) -> None:
-    thread.join(timeout=_TIMEOUT_CLEANUP_SECONDS)
-    if thread.is_alive():
+    """Finish all pipe readers within one shared cleanup budget.
+
+    A descendant can escape the test process group while retaining both output
+    descriptors.  Waiting the full budget for stdout and then again for stderr
+    makes timeout handling scale with the number of pipes.  Worse, closing a
+    buffered pipe whose reader thread is blocked can itself wait for that
+    descendant on some POSIX systems.  Use shared deadlines and leave any
+    still-blocked daemon reader to observe EOF later instead.
+    """
+
+    deadline = time.monotonic() + _TIMEOUT_CLEANUP_SECONDS
+    for _pipe, thread, _capture in captures:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    blocked = tuple(item for item in captures if item[1].is_alive())
+    for pipe, _thread, capture in blocked:
         capture.truncated = True
         if pipe is not None:
             try:
                 os.close(pipe.fileno())
+            except (OSError, ValueError):
+                pass
+
+    deadline = time.monotonic() + _TIMEOUT_CLEANUP_SECONDS
+    for _pipe, thread, _capture in blocked:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    for pipe, thread, capture in captures:
+        if thread.is_alive():
+            capture.truncated = True
+            # ``pipe.close()`` may block on the buffered reader lock held by
+            # this thread.  The daemon owns the pipe until its escaped writer
+            # exits, at which point the closure is reclaimed normally.
+            continue
+        if pipe is not None:
+            try:
+                pipe.close()
             except OSError:
                 pass
-        thread.join(timeout=_TIMEOUT_CLEANUP_SECONDS)
-    if pipe is not None:
-        try:
-            pipe.close()
-        except OSError:
-            pass
 
 
 def classify_junit_result(
