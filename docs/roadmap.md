@@ -33,9 +33,7 @@ whether an observed transition proves a regression.
 - Avoid treating context as classification evidence or implying a complete
   call graph.
 
-## Milestone 2: requirement extraction — in progress
-
-Delivered in the first increment:
+## Milestone 2: requirement extraction and review — complete
 
 - Extract review-only candidate requirements from conservative issue criteria,
   relevant base documentation, and statically selected pre-existing pytest
@@ -48,14 +46,19 @@ Delivered in the first increment:
   promote a candidate to a strong requirement.
 - Exercise misleading prose, dynamic calls, duplicate definitions,
   parametrization, unrelated tests, and resource limits in a benchmark corpus.
-
-Remaining in this milestone:
-
 - Detect and present potential conflicts between issue intent and existing
   contracts without claiming a semantic contradiction that static analysis
   cannot establish.
-- Add an explicit human acceptance/editing workflow that produces requirements
-  suitable for an evidence plan.
+- Record whether conflict analysis was truncated and how many candidates and
+  pairs it considered so a partial search cannot look complete.
+- Bind an editable decision ledger to the exact draft bytes, keep the complete
+  candidate evidence beside every decision, and require a human rationale for
+  every acceptance, edit, or rejection.
+- Recompute advisory conflict metadata and reject pending decisions, drift,
+  duplicate or unknown candidates, unstable requirement IDs, and source-kind
+  or provenance escalation during finalization.
+- Produce a reviewed requirement set whose records can be copied directly into
+  an evidence plan before candidate tests are generated.
 
 ## Milestone 3: model-driven candidate generation
 

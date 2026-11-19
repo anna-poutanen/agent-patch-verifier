@@ -42,14 +42,23 @@ jobs:
         run: |
           cd /tmp
           python - <<'PY'
+          from importlib.metadata import files as distribution_files, metadata
           from importlib.resources import files
           from patch_verifier import __version__
 
-          assert __version__ == "0.3.0"
+          assert __version__ == "0.4.0"
+          package_metadata = metadata("agent-patch-verifier")
+          assert package_metadata["License-Expression"] == "Apache-2.0"
+          assert any(
+              str(path).endswith("licenses/LICENSE")
+              for path in distribution_files("agent-patch-verifier") or ()
+          )
           schemas = files("patch_verifier").joinpath("schemas")
           assert schemas.joinpath("evidence-plan.schema.json").is_file()
           assert schemas.joinpath("context.schema.json").is_file()
           assert schemas.joinpath("manifest.schema.json").is_file()
           assert schemas.joinpath("requirements-draft.schema.json").is_file()
+          assert schemas.joinpath("requirement-review.schema.json").is_file()
+          assert schemas.joinpath("reviewed-requirements.schema.json").is_file()
           PY
           apv --version

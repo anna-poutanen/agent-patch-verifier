@@ -1367,7 +1367,7 @@ def _extract_docstring(
         )
         return
     statement = inspect.cleandoc(docstring).strip()
-    if not statement or not _looks_behavioral_docstring(statement):
+    if not statement or not looks_behavioral_docstring(statement):
         return
     excerpt = ast.get_source_segment(source_text, expression)
     if not excerpt:
@@ -1396,7 +1396,9 @@ def _extract_docstring(
         state.add_candidate(candidate)
 
 
-def _looks_behavioral_docstring(statement: str) -> bool:
+def looks_behavioral_docstring(statement: str) -> bool:
+    """Return whether docstring text expresses a behavioral expectation."""
+
     first_line = next(
         (line.strip() for line in statement.splitlines() if line.strip()), ""
     )

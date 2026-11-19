@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-patch-verifier"
-version = "0.3.0"
+version = "0.4.0"
 description = "Evidence-first verification of proposed Python patches"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,6 +26,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Testing",
 ]
+
+[project.urls]
+Homepage = "https://github.com/anna-poutanen/agent-patch-verifier"
+Repository = "https://github.com/anna-poutanen/agent-patch-verifier.git"
+Issues = "https://github.com/anna-poutanen/agent-patch-verifier/issues"
 
 [project.scripts]
 apv = "patch_verifier.cli:main"

@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-patch-verifier:reviewed-requirements:1",
+  "title": "Agent Patch Verifier reviewed requirements",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "draft",
+    "review",
+    "requirements",
+    "audit"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "artifact_type": {"const": "reviewed-requirements"},
+    "draft": {"$ref": "#/$defs/draft_binding"},
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "schema_version"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"const": 1}
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"$ref": "#/$defs/requirement"}
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_count",
+        "accepted_count",
+        "edited_count",
+        "rejected_count",
+        "conflict_analysis",
+        "conflict_hints",
+        "decisions"
+      ],
+      "properties": {
+        "candidate_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500
+        },
+        "accepted_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "edited_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "rejected_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500
+        },
+        "conflict_hints": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/conflict_hint"}
+        },
+        "conflict_analysis": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/conflict_analysis"}
+          ]
+        },
+        "decisions": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {"$ref": "#/$defs/terminal_decision"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^cand-[0-9a-f]{64}$"
+    },
+    "requirement_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+    },
+    "draft_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "schema_version", "candidate_count"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"const": 1},
+        "candidate_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500
+        }
+      }
+    },
+    "conflict_hint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "candidate_ids", "message"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+        },
+        "candidate_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/candidate_id"}
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "conflict_analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_candidate_count",
+        "preservation_candidate_count",
+        "compared_pair_count",
+        "hint_count",
+        "truncated"
+      ],
+      "properties": {
+        "requested_candidate_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500
+        },
+        "preservation_candidate_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500
+        },
+        "compared_pair_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000
+        },
+        "hint_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 200
+        },
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "candidate_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "statement",
+        "intent",
+        "source_kind",
+        "source",
+        "review_status",
+        "confidence",
+        "rationale"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/candidate_id"},
+        "statement": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "intent": {"enum": ["requested", "preservation"]},
+        "source_kind": {
+          "enum": ["issue", "pytest_assertion", "docstring"]
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "start_line",
+            "end_line",
+            "start_column",
+            "end_column",
+            "excerpt",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "\\S"
+            },
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "start_column": {"type": "integer", "minimum": 0},
+            "end_column": {"type": "integer", "minimum": 0},
+            "excerpt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16000
+            },
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "review_status": {"const": "requires_review"},
+        "confidence": {"enum": ["high", "medium", "low"]},
+        "rationale": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "replacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement", "kind", "provenance"],
+      "properties": {
+        "statement": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "kind": {"enum": ["requested", "preservation"]},
+        "provenance": {
+          "enum": ["explicit", "preexisting", "inferred"]
+        }
+      }
+    },
+    "terminal_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "candidate",
+        "action",
+        "requirement_id",
+        "rationale",
+        "replacement"
+      ],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/candidate_id"},
+        "candidate": {"$ref": "#/$defs/candidate_preview"},
+        "action": {"enum": ["accept", "edit", "reject"]},
+        "requirement_id": {
+          "$ref": "#/$defs/requirement_id"
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "replacement": {
+          "oneOf": [
+            {"$ref": "#/$defs/replacement"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "statement",
+        "kind",
+        "provenance",
+        "source",
+        "excerpt"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/requirement_id"},
+        "statement": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "kind": {"enum": ["requested", "preservation"]},
+        "provenance": {
+          "enum": ["explicit", "preexisting", "inferred"]
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 4128,
+          "pattern": "\\S"
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000
+        }
+      }
+    }
+  }
+}

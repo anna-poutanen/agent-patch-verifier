@@ -27,6 +27,18 @@ class _DraftResult(Protocol):
     truncated: bool
 
 
+class _ReviewPreparationResult(Protocol):
+    output_file: Path
+    candidate_count: int
+    conflict_hint_count: int
+
+
+class _ReviewFinalizationResult(Protocol):
+    output_file: Path
+    requirement_count: int
+    rejected_count: int
+
+
 def _draft_patch_requirements(
     *,
     repository: Path,
@@ -59,12 +71,135 @@ def _draft_patch_requirements(
         raise ValueError(str(exc)) from exc
 
 
+def _load_requirement_draft(draft_file: Path) -> dict[str, object]:
+    """Load only the parsed value of a bounded requirement draft."""
+
+    payload, _ = _load_requirement_draft_with_digest(draft_file)
+    return payload
+
+
+def _load_requirement_draft_with_digest(
+    draft_file: Path,
+) -> tuple[dict[str, object], str]:
+    """Load a bounded JSON object for conflict analysis.
+
+    The review subsystem separately reads and validates the exact draft bytes
+    that it binds into an artifact. The returned digest lets that second read
+    fail if the file changed after this bounded, duplicate-free parse.
+    """
+
+    import hashlib
+    import json
+
+    maximum_bytes = 10 * 1024 * 1024
+    path = Path(draft_file).resolve()
+    try:
+        with path.open("rb") as stream:
+            document = stream.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise ValueError(f"cannot read requirement draft {path}: {exc}") from exc
+    if len(document) > maximum_bytes:
+        raise ValueError(
+            f"requirement draft exceeds the {maximum_bytes}-byte limit"
+        )
+    if not document.strip():
+        raise ValueError("requirement draft is empty")
+    try:
+        text = document.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("requirement draft must be UTF-8") from exc
+
+    class _DuplicateKeyError(ValueError):
+        pass
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise _DuplicateKeyError(
+                    f"duplicate JSON object key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except _DuplicateKeyError as exc:
+        raise ValueError(f"requirement draft contains {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "requirement draft is not valid JSON at "
+            f"line {exc.lineno}, column {exc.colno}"
+        ) from exc
+    except (RecursionError, ValueError) as exc:
+        raise ValueError("requirement draft is not safely parseable JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("requirement draft must contain a JSON object")
+    return payload, hashlib.sha256(document).hexdigest()
+
+
+def _prepare_requirement_review(
+    *,
+    draft_file: Path,
+    output_file: Path,
+) -> tuple[_ReviewPreparationResult, bool]:
+    """Analyze a draft and write an inert, all-pending review ledger."""
+
+    from .conflicts import ConflictAnalysisError, analyze_draft_conflicts
+    from .review import RequirementReviewError, write_requirement_review
+
+    draft, draft_sha256 = _load_requirement_draft_with_digest(draft_file)
+    try:
+        analysis = analyze_draft_conflicts(draft)
+        hints = tuple(hint.to_dict() for hint in analysis.hints)
+        result = write_requirement_review(
+            draft_file,
+            output_file,
+            conflict_hints=hints,
+            conflict_analysis=analysis.to_dict(),
+            expected_draft_sha256=draft_sha256,
+        )
+    except (ConflictAnalysisError, RequirementReviewError) as exc:
+        raise ValueError(str(exc)) from exc
+    return result, analysis.truncated
+
+
+def _finalize_requirement_review(
+    *,
+    draft_file: Path,
+    review_file: Path,
+    output_file: Path,
+) -> tuple[_ReviewFinalizationResult, bool]:
+    """Recompute advisory hints and finalize explicit human decisions."""
+
+    from .conflicts import ConflictAnalysisError, analyze_draft_conflicts
+    from .review import RequirementReviewError, write_reviewed_requirements
+
+    draft, draft_sha256 = _load_requirement_draft_with_digest(draft_file)
+    try:
+        analysis = analyze_draft_conflicts(draft)
+        hints = tuple(hint.to_dict() for hint in analysis.hints)
+        result = write_reviewed_requirements(
+            draft_file,
+            review_file,
+            output_file,
+            expected_conflict_hints=hints,
+            expected_conflict_analysis=analysis.to_dict(),
+            expected_draft_sha256=draft_sha256,
+        )
+    except (ConflictAnalysisError, RequirementReviewError) as exc:
+        raise ValueError(str(exc)) from exc
+    return result, analysis.truncated
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apv",
         description=(
-            "Draft review-only requirements or run requirement-linked pytest "
-            "evidence against base and patched revisions."
+            "Draft and explicitly review requirements, or run requirement-linked "
+            "pytest evidence against base and patched revisions."
         ),
     )
     parser.add_argument(
@@ -103,6 +238,44 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="new JSON artifact path; existing files are never overwritten",
+    )
+    prepare_review_parser = subparsers.add_parser(
+        "prepare-review",
+        help="create an all-pending human review ledger from a draft",
+    )
+    prepare_review_parser.add_argument(
+        "--draft",
+        type=Path,
+        required=True,
+        help="requirement-draft JSON artifact",
+    )
+    prepare_review_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="new review-ledger path; existing files are never overwritten",
+    )
+    finalize_review_parser = subparsers.add_parser(
+        "finalize-review",
+        help="finalize explicit human decisions into reviewed requirements",
+    )
+    finalize_review_parser.add_argument(
+        "--draft",
+        type=Path,
+        required=True,
+        help="exact requirement draft used to prepare the review ledger",
+    )
+    finalize_review_parser.add_argument(
+        "--review",
+        type=Path,
+        required=True,
+        help="completed review ledger with no pending decisions",
+    )
+    finalize_review_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="new reviewed-requirements path; existing files are never overwritten",
     )
     verify_parser = subparsers.add_parser(
         "verify", help="verify a proposed textual Git patch"
@@ -161,6 +334,44 @@ def main(argv: Sequence[str] | None = None) -> None:
             if draft_result.truncated:
                 print(
                     "Warning: candidate extraction was truncated.",
+                    file=sys.stderr,
+                )
+            return
+        if arguments.command == "prepare-review":
+            review_result, analysis_truncated = _prepare_requirement_review(
+                draft_file=arguments.draft,
+                output_file=arguments.output,
+            )
+            print(f"Review: {review_result.output_file}")
+            print(
+                f"Candidates: {review_result.candidate_count} "
+                "(all pending; explicit human review required)"
+            )
+            print(
+                f"Potential tension hints: {review_result.conflict_hint_count} "
+                "(advisory only; no candidate tests were generated or run)"
+            )
+            if analysis_truncated:
+                print(
+                    "Warning: conflict analysis was truncated; the review may "
+                    "be missing potential tension hints.",
+                    file=sys.stderr,
+                )
+            return
+        if arguments.command == "finalize-review":
+            review_result, analysis_truncated = _finalize_requirement_review(
+                draft_file=arguments.draft,
+                review_file=arguments.review,
+                output_file=arguments.output,
+            )
+            print(f"Reviewed requirements: {review_result.output_file}")
+            print(f"Accepted: {review_result.requirement_count}")
+            print(f"Rejected: {review_result.rejected_count}")
+            print("No candidate tests were generated or run.")
+            if analysis_truncated:
+                print(
+                    "Warning: conflict analysis was truncated; the review may "
+                    "be missing potential tension hints.",
                     file=sys.stderr,
                 )
             return

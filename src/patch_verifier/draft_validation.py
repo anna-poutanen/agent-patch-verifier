@@ -15,7 +15,7 @@ import re
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from .requirements import _looks_behavioral_docstring
+from .requirements import looks_behavioral_docstring
 
 
 def validate_requirement_draft_artifact(payload: object) -> None:
@@ -250,14 +250,18 @@ def _validate_semantics(payload: Mapping[str, object]) -> None:
                     "base source must be a safe repository-relative path"
                 )
 
-        expected_statement = _candidate_statement(source_kind, excerpt, index)
+        expected_statement = canonical_candidate_statement(
+            source_kind,
+            excerpt,
+            error_path=f"requirement_draft.draft.candidates[{index}].source.excerpt",
+        )
         if statement != expected_statement:
             raise ValueError(
                 f"requirement_draft.draft.candidates[{index}].statement: "
                 "statement is not the deterministic transform of its exact "
                 "source excerpt"
             )
-        if source_kind == "docstring" and not _looks_behavioral_docstring(
+        if source_kind == "docstring" and not looks_behavioral_docstring(
             statement
         ):
             raise ValueError(
@@ -547,20 +551,32 @@ def _validate_changed_symbols(changed_symbols: list[object]) -> None:
             )
 
 
-def _candidate_statement(source_kind: str, excerpt: str, index: int) -> str:
+def canonical_candidate_statement(
+    source_kind: str,
+    excerpt: str,
+    *,
+    error_path: str,
+) -> str:
+    """Return the deterministic candidate wording for one exact excerpt.
+
+    Draft and review validation share this transform so a portable review
+    ledger cannot substitute unrelated wording and merely recompute its IDs.
+    ``error_path`` keeps failures anchored to the artifact being validated.
+    """
+
     if source_kind == "issue":
         return excerpt
 
     try:
         tree = ast.parse(excerpt)
-    except (SyntaxError, ValueError, RecursionError) as exc:
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
         raise ValueError(
-            f"requirement_draft.draft.candidates[{index}].source.excerpt: "
+            f"{error_path}: "
             f"{source_kind} excerpt is not valid static Python syntax"
         ) from exc
     if len(tree.body) != 1:
         raise ValueError(
-            f"requirement_draft.draft.candidates[{index}].source.excerpt: "
+            f"{error_path}: "
             f"{source_kind} excerpt must contain exactly one Python statement"
         )
 
@@ -568,13 +584,13 @@ def _candidate_statement(source_kind: str, excerpt: str, index: int) -> str:
     if source_kind == "pytest_assertion":
         if not isinstance(node, ast.Assert):
             raise ValueError(
-                f"requirement_draft.draft.candidates[{index}].source.excerpt: "
+                f"{error_path}: "
                 "pytest_assertion excerpt must be an assert statement"
             )
         expression = ast.get_source_segment(excerpt, node.test)
         if not expression:
             raise ValueError(
-                f"requirement_draft.draft.candidates[{index}].source.excerpt: "
+                f"{error_path}: "
                 "pytest assertion expression is unavailable"
             )
         return "Preserve the behavior asserted by the base test: " + expression.strip()
@@ -585,7 +601,7 @@ def _candidate_statement(source_kind: str, excerpt: str, index: int) -> str:
         or not isinstance(node.value.value, str)
     ):
         raise ValueError(
-            f"requirement_draft.draft.candidates[{index}].source.excerpt: "
+            f"{error_path}: "
             "docstring excerpt must be one literal string expression"
         )
     cleaned = inspect.cleandoc(node.value.value)

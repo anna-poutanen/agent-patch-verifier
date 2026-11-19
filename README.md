@@ -12,7 +12,7 @@ called a supported regression only when it checks a strongly sourced
 preservation requirement. A run with no finding is not proof that the patch is
 correct.
 
-The current development release is `0.3.0`.
+The current development release is `0.4.0`.
 
 ## Current status
 
@@ -30,6 +30,12 @@ This repository contains the first deterministic vertical slice:
 - deterministic, review-only requirement drafting from conservative issue
   criteria, relevant base-side pytest assertions, and behavioral docstrings,
   with exact source spans, hashes, confidence, rationale, and intent;
+- conservative potential-tension hints between requested and preservation
+  candidates, with explicit search accounting and no claim that a conflict is
+  semantically established;
+- an exact-draft-bound human review ledger that requires an accept, edit, or
+  reject decision with rationale for every candidate before it can emit
+  reviewed requirements;
 - a reviewable requirement and candidate-test ledger;
 - fresh worktrees for every case and repeat, plus shell-free pytest execution
   with timeouts and bounded output capture;
@@ -42,11 +48,12 @@ This repository contains the first deterministic vertical slice:
   and
 - hash-checked bundle reproduction with drift detection.
 
-Requirement drafting is now available, but verification still consumes an
-explicit evidence plan. A draft never becomes an oracle automatically and is
-never runs as a test. Conflict review, explicit acceptance, and model-driven
-test generation remain future work; this boundary prevents generated or
-heuristic text from being treated as ground truth.
+Requirement drafting and explicit human review are available, but verification
+still consumes an evidence plan with independently reviewable pytest cases. A
+draft never becomes an oracle automatically and never runs as a test. Reviewed
+requirements supply the requirements portion of a future evidence plan; they
+do not generate assertions or execute code. Model-driven test generation
+remains future work.
 
 ## Install for development
 
@@ -88,13 +95,72 @@ visible to reviewers.
 The JSON envelope binds the draft to the base commit, patched Git tree, patch
 bytes, issue bytes, base context, changed symbols, verifier version, and Python
 runtime used for static parsing. The command refuses to overwrite an existing
-output file. It does not resolve
-conflicts, create an evidence plan, or generate or run candidate tests. Git
+output file. It does not establish correctness, create an evidence plan, or
+generate or run candidate tests. Git
 worktree materialization can invoke repository-configured checkout hooks and
 clean/smudge filters, so drafting is only suitable for trusted repositories.
 See
 [`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json)
 for the portable format.
+
+## Review requirement candidates
+
+Turn a draft into a human-editable decision ledger:
+
+```bash
+apv prepare-review \
+  --draft requirements-draft.json \
+  --output requirement-review.json
+```
+
+The ledger repeats each candidate and its exact source evidence beside an
+initial `pending` decision. It also gives each candidate a deterministic
+`req-...` identifier that fits the evidence-plan format. Reviewers leave the
+candidate preview and identifier unchanged, then choose one action:
+
+- `accept`: keep `replacement` as `null` and add a non-empty `rationale`;
+- `edit`: add a rationale and a `replacement` containing the revised
+  `statement` plus the candidate's unchanged source-backed `kind` and
+  `provenance`; or
+- `reject`: keep `replacement` as `null` and explain the rejection.
+
+For an issue candidate, the source-backed pair is `requested` / `explicit`.
+For a pytest assertion or behavioral docstring, it is `preservation` /
+`preexisting`. A different pair must be rejected as a new unsupported claim,
+not smuggled into the original candidate as an edit.
+
+Preparation also compares requested issue candidates with base-side
+preservation candidates using narrow numeric-literal, string-literal, and
+polarity signals. These are potential-tension hints for a reviewer, not proof
+that either source is correct or that the two requirements contradict one
+another. The ledger records candidate counts, compared pairs, hint count, and
+whether the bounded search was truncated.
+
+After every decision is terminal, finalize the ledger:
+
+```bash
+apv finalize-review \
+  --draft requirements-draft.json \
+  --review requirement-review.json \
+  --output reviewed-requirements.json
+```
+
+Finalization checks the exact draft hash, immutable candidate previews,
+deterministic IDs, decision ordering, and complete accept/edit/reject state. It
+recomputes the advisory conflict analysis, refuses an edited kind or provenance
+that is not supported by the original source, and never overwrites an existing
+output. Neither review command imports target code, generates tests, invokes
+pytest, or decides whether the patch is correct.
+
+The resulting `requirements` array uses the same records as an evidence plan.
+It is not a complete evidence plan: a later step must add separately reviewed
+pytest `cases` that each reference one accepted requirement. The finalized
+artifact retains the exact draft and review hashes plus all decisions and
+conflict metadata as an audit trail. See
+[`requirement-review.schema.json`](src/patch_verifier/schemas/requirement-review.schema.json)
+and
+[`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json)
+for the portable formats.
 
 ## Evidence plan
 
@@ -247,15 +313,19 @@ case count, artifact sizes, and output-capture limit fit the current safety and
 execution contract; incompatible v1 bundles fail preflight with an explicit
 error instead of running under silently different limits.
 
-The current artifact versions are independent: release `0.3.0` writes manifest
-schema v2, context schema v1, evidence-plan schema v1, and requirement-draft
-schema v1. Consumers should use each artifact's own `schema_version`, not the
-package version, for compatibility decisions. The packaged contracts are
+The current artifact versions are independent: release `0.4.0` writes manifest
+schema v2 plus context, evidence-plan, requirement-draft, requirement-review,
+and reviewed-requirements schema v1 artifacts. Consumers should use each
+artifact's own `schema_version`, not the package version, for compatibility
+decisions. The packaged contracts are
 [`manifest.schema.json`](src/patch_verifier/schemas/manifest.schema.json),
 [`context.schema.json`](src/patch_verifier/schemas/context.schema.json), and
 [`evidence-plan.schema.json`](src/patch_verifier/schemas/evidence-plan.schema.json),
 plus
-[`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json).
+[`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json),
+[`requirement-review.schema.json`](src/patch_verifier/schemas/requirement-review.schema.json),
+and
+[`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json).
 
 ## Scope and safety
 
@@ -290,6 +360,19 @@ Requirement drafting separately limits issue input to 1,000,000 UTF-8 bytes and
 bytes in aggregate, and output to 500 candidates and 200 diagnostics. Static
 selection can omit valid contracts and conservative issue parsing can miss
 valid prose; a draft is a review aid, not a completeness or correctness claim.
+
+Review preparation accepts a requirement draft of at most 10 MiB, compares at
+most 20,000 requested/preservation pairs, retains at most 200 advisory hints,
+and writes a ledger of at most 16 MiB. Finalization accepts a review ledger of
+at most 16 MiB, emits at most 200 requirements in a 24 MiB artifact, and fails
+if conflict analysis was changed rather than merely reviewed. Truncation is
+recorded, but a non-truncated heuristic search still cannot prove that every
+semantic tension was found.
+
+The SHA-256 links between draft, review, and finalized output detect drift; they
+do not authenticate who authored or approved an artifact. Accepting or editing
+a requirement is a human attestation that the cited excerpt supports it, not a
+correctness conclusion established by APV.
 
 Evidence bundles can contain issue text, candidate code, source excerpts,
 commands, filesystem paths, and captured test output. Review them before

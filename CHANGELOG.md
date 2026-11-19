@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — 2026-11-19
+
+- License the project under Apache License 2.0 and publish SPDX license
+  metadata in built distributions.
+- Add deterministic, review-only tension hints for narrowly matched numeric,
+  string, and polarity differences between requested behavior and base-side
+  preservation candidates. Hints remain advisory and explicitly do not claim
+  a contradiction.
+- Add `apv prepare-review` to create an exact-draft-bound human decision
+  ledger with immutable candidate previews, stable EvidencePlan-compatible
+  requirement IDs, conflict-search accounting, and pending decisions.
+- Add `apv finalize-review` to require an explicit accept, edit, or reject
+  decision with rationale for every candidate before producing reviewed
+  requirements and a complete audit trail.
+- Recompute conflict metadata during finalization, reject draft or preview
+  drift, preserve exact source excerpts, and prevent edits from escalating or
+  changing source-backed kind and provenance.
+- Add strict JSON Schemas, duplicate-key rejection, bounded input and output,
+  atomic no-overwrite writes, and adversarial state-machine tests for both
+  review artifacts.
+
 ## 0.3.0 — 2026-11-19
 
 - Add deterministic, review-only requirement candidate extraction from issue
