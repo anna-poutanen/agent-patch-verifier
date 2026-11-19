@@ -10,7 +10,7 @@ called a supported regression only when it checks a strongly sourced
 preservation requirement. A run with no finding is not proof that the patch is
 correct.
 
-The current development release is `0.2.0`.
+The current development release is `0.3.0`.
 
 ## Current status
 
@@ -25,6 +25,9 @@ This repository contains the first deterministic vertical slice:
   symbols, including signatures, docstrings, imports, likely callers, nearby
   tests, selection reasons, diagnostics, analysis limitations, and explicit
   resource bounds;
+- deterministic, review-only requirement drafting from conservative issue
+  criteria, relevant base-side pytest assertions, and behavioral docstrings,
+  with exact source spans, hashes, confidence, rationale, and intent;
 - a reviewable requirement and candidate-test ledger;
 - fresh worktrees for every case and repeat, plus shell-free pytest execution
   with timeouts and bounded output capture;
@@ -37,10 +40,11 @@ This repository contains the first deterministic vertical slice:
   and
 - hash-checked bundle reproduction with drift detection.
 
-Automated requirement extraction and model-driven test generation are the next
-milestone. For now, `apv` consumes an explicit evidence plan. Keeping this
-boundary manual first makes the execution and classification layer testable
-without treating model output as ground truth.
+Requirement drafting is now available, but verification still consumes an
+explicit evidence plan. A draft never becomes an oracle automatically and is
+never runs as a test. Conflict review, explicit acceptance, and model-driven
+test generation remain future work; this boundary prevents generated or
+heuristic text from being treated as ground truth.
 
 ## Install for development
 
@@ -52,6 +56,43 @@ python -m pytest -q
 Python 3.11–3.13, Git, and pytest are required. Target-project dependencies
 must already be available in the selected Python environment. Check the
 installed release with `apv --version`.
+
+## Draft requirement candidates
+
+Create a review queue from an issue and an exact textual patch:
+
+```bash
+apv draft-requirements \
+  --repo /path/to/project \
+  --base HEAD \
+  --patch proposed.diff \
+  --issue issue.md \
+  --output requirements-draft.json
+```
+
+The command materializes isolated base and patched worktrees, maps the diff to
+changed Python symbols, collects base-side context, and emits only unaccepted
+candidate requirements. Issue candidates are labeled `requested`; relevant
+base assertions and behavioral docstrings are labeled `preservation`. Every
+candidate remains `requires_review` and records an exact excerpt, source span,
+SHA-256, confidence, and rationale.
+
+The parser deliberately skips prose under headings such as current or broken
+behavior and does not treat skipped, conditionally skipped, or expected-failure
+pytest assertions as preservation contracts. Diagnostics and limitations from
+the base-context pass are carried into the draft so an incomplete search is
+visible to reviewers.
+
+The JSON envelope binds the draft to the base commit, patched Git tree, patch
+bytes, issue bytes, base context, changed symbols, verifier version, and Python
+runtime used for static parsing. The command refuses to overwrite an existing
+output file. It does not resolve
+conflicts, create an evidence plan, or generate or run candidate tests. Git
+worktree materialization can invoke repository-configured checkout hooks and
+clean/smudge filters, so drafting is only suitable for trusted repositories.
+See
+[`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json)
+for the portable format.
 
 ## Evidence plan
 
@@ -204,13 +245,15 @@ case count, artifact sizes, and output-capture limit fit the current safety and
 execution contract; incompatible v1 bundles fail preflight with an explicit
 error instead of running under silently different limits.
 
-The current artifact versions are independent: release `0.2.0` writes manifest
-schema v2, context schema v1, and evidence-plan schema v1. Consumers should use
-each artifact's own `schema_version`, not the package version, for compatibility
-decisions. The packaged contracts are
+The current artifact versions are independent: release `0.3.0` writes manifest
+schema v2, context schema v1, evidence-plan schema v1, and requirement-draft
+schema v1. Consumers should use each artifact's own `schema_version`, not the
+package version, for compatibility decisions. The packaged contracts are
 [`manifest.schema.json`](src/patch_verifier/schemas/manifest.schema.json),
 [`context.schema.json`](src/patch_verifier/schemas/context.schema.json), and
-[`evidence-plan.schema.json`](src/patch_verifier/schemas/evidence-plan.schema.json).
+[`evidence-plan.schema.json`](src/patch_verifier/schemas/evidence-plan.schema.json),
+plus
+[`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json).
 
 ## Scope and safety
 
@@ -225,6 +268,8 @@ required before accepting untrusted code. The import-origin guard is a
 correctness check, not an isolation boundary: it covers direct absolute imports
 in candidate tests and the repository root plus common `src`, `lib`, `python`,
 and `source` layouts, but not every indirect or dynamic import pattern.
+Creating the isolated Git worktrees may itself run trusted repository checkout
+hooks or filters before any verifier subprocess begins.
 
 Static context is heuristic and may be truncated or absent. Collection skips
 symlinks, selected build/cache directories, unsafe or unparseable files, files
@@ -237,6 +282,12 @@ limited to 20 MiB, issues to 2 MiB, repeat to five, and a run to 50 total
 case-repetitions. Each subprocess timeout may be at most one hour. These are
 safety and predictability limits, not claims that inputs near the limits will
 be fast on every project.
+
+Requirement drafting separately limits issue input to 1,000,000 UTF-8 bytes and
+20,000 lines, relevant base source to 2,000,000 bytes per file and 20,000,000
+bytes in aggregate, and output to 500 candidates and 200 diagnostics. Static
+selection can omit valid contracts and conservative issue parsing can miss
+valid prose; a draft is a review aid, not a completeness or correctness claim.
 
 Evidence bundles can contain issue text, candidate code, source excerpts,
 commands, filesystem paths, and captured test output. Review them before

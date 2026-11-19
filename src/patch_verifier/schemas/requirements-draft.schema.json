@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-patch-verifier:requirements-draft:1",
+  "title": "Agent Patch Verifier requirement-draft artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tool_version",
+    "environment",
+    "inputs",
+    "changed_symbols",
+    "draft"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "tool_version": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[A-Za-z0-9.+-]*)?$"
+    },
+    "environment": {"$ref": "#/$defs/environment"},
+    "inputs": {"$ref": "#/$defs/inputs"},
+    "changed_symbols": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {"$ref": "#/$defs/changedSymbol"}
+    },
+    "draft": {"$ref": "#/$defs/draft"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitObjectId": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python_executable", "python_version", "platform"],
+      "properties": {
+        "python_executable": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "python_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "base_revision",
+        "base_sha",
+        "base_context_sha256",
+        "patched_tree_hash",
+        "patch_sha256",
+        "issue_sha256",
+        "issue_source"
+      ],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "base_revision": {
+          "type": "string",
+          "maxLength": 1024,
+          "pattern": "\\S"
+        },
+        "base_sha": {"$ref": "#/$defs/gitObjectId"},
+        "base_context_sha256": {"$ref": "#/$defs/sha256"},
+        "patched_tree_hash": {"$ref": "#/$defs/gitObjectId"},
+        "patch_sha256": {"$ref": "#/$defs/sha256"},
+        "issue_sha256": {"$ref": "#/$defs/sha256"},
+        "issue_source": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Runtime construction also requires end_line to be greater than or equal to start_line.",
+      "required": ["start_line", "end_line"],
+      "properties": {
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1}
+      }
+    },
+    "sourceLines": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1}
+    },
+    "changedSymbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "qualified_name",
+        "kind",
+        "base_span",
+        "patched_span",
+        "removed_lines",
+        "added_lines",
+        "base_path",
+        "patched_path",
+        "base_occurrence",
+        "patched_occurrence",
+        "revision_match"
+      ],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "qualified_name": {"type": "string", "minLength": 1},
+        "kind": {
+          "enum": ["module", "class", "function", "async_function"]
+        },
+        "base_span": {
+          "anyOf": [
+            {"$ref": "#/$defs/span"},
+            {"type": "null"}
+          ]
+        },
+        "patched_span": {
+          "anyOf": [
+            {"$ref": "#/$defs/span"},
+            {"type": "null"}
+          ]
+        },
+        "removed_lines": {"$ref": "#/$defs/sourceLines"},
+        "added_lines": {"$ref": "#/$defs/sourceLines"},
+        "base_path": {"type": ["string", "null"], "minLength": 1},
+        "patched_path": {"type": ["string", "null"], "minLength": 1},
+        "base_occurrence": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "patched_occurrence": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "revision_match": {
+          "enum": [
+            "unique",
+            "module",
+            "unique_identity",
+            "base_only",
+            "patched_only",
+            "ambiguous_duplicate_unpaired",
+            "path_change_module",
+            "path_change_unique_identity",
+            "path_change_base_only",
+            "path_change_patched_only",
+            "path_change_ambiguous_duplicate_unpaired"
+          ]
+        }
+      }
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "candidates",
+        "diagnostics",
+        "limitations",
+        "truncated"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "candidates": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {"$ref": "#/$defs/candidate"}
+        },
+        "diagnostics": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/diagnostic"}
+        },
+        "limitations": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {"type": "string", "maxLength": 4000}
+        },
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {"source_kind": {"const": "issue"}},
+            "required": ["source_kind"]
+          },
+          "then": {
+            "properties": {"intent": {"const": "requested"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source_kind": {
+                "enum": ["pytest_assertion", "docstring"]
+              }
+            },
+            "required": ["source_kind"]
+          },
+          "then": {
+            "properties": {"intent": {"const": "preservation"}}
+          }
+        }
+      ],
+      "required": [
+        "id",
+        "statement",
+        "intent",
+        "source_kind",
+        "source",
+        "review_status",
+        "confidence",
+        "rationale"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^cand-[0-9a-f]{64}$"
+        },
+        "statement": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "intent": {"enum": ["requested", "preservation"]},
+        "source_kind": {
+          "enum": ["issue", "pytest_assertion", "docstring"]
+        },
+        "source": {"$ref": "#/$defs/source"},
+        "review_status": {"const": "requires_review"},
+        "confidence": {"enum": ["high", "medium", "low"]},
+        "rationale": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Line coordinates are one-based; columns are zero-based UTF-8 byte offsets and end_column is exclusive. Runtime construction also checks ordered ranges.",
+      "required": [
+        "path",
+        "start_line",
+        "end_line",
+        "start_column",
+        "end_column",
+        "excerpt",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "\\S"
+        },
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "start_column": {"type": "integer", "minimum": 0},
+        "end_column": {"type": "integer", "minimum": 0},
+        "excerpt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "source", "message", "line"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "\\S"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "\\S"
+        },
+        "line": {"type": ["integer", "null"], "minimum": 1}
+      }
+    }
+  }
+}

@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import shlex
 import sys
-from typing import Sequence
+from typing import Protocol, Sequence
 
 from . import __version__
 from .plan import PlanError
@@ -21,17 +21,89 @@ from .verifier import (
 from .workspace import WorkspaceError
 
 
+class _DraftResult(Protocol):
+    output_file: Path
+    candidate_count: int
+    truncated: bool
+
+
+def _draft_patch_requirements(
+    *,
+    repository: Path,
+    base_revision: str,
+    patch_file: Path,
+    issue_file: Path,
+    output_file: Path,
+) -> _DraftResult:
+    """Call drafting orchestration without widening top-level CLI imports."""
+
+    from .drafting import (
+        DraftingError,
+        DraftRequirementsRequest,
+        draft_patch_requirements,
+    )
+    from .requirements import RequirementExtractionError
+
+    request = DraftRequirementsRequest(
+        repository=repository,
+        base_revision=base_revision,
+        patch_file=patch_file,
+        issue_file=issue_file,
+        output_file=output_file,
+    )
+    try:
+        return draft_patch_requirements(request)
+    except (DraftingError, RequirementExtractionError) as exc:
+        # Keep argparse's established, user-facing exit-code-two behavior
+        # without making every CLI invocation import the drafting subsystem.
+        raise ValueError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apv",
         description=(
-            "Run requirement-linked pytest evidence against base and patched revisions."
+            "Draft review-only requirements or run requirement-linked pytest "
+            "evidence against base and patched revisions."
         ),
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    draft_parser = subparsers.add_parser(
+        "draft-requirements",
+        help="extract review-only requirement candidates for a Git patch",
+    )
+    draft_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="source Git repository (default: current directory)",
+    )
+    draft_parser.add_argument(
+        "--base",
+        default="HEAD",
+        help="committed base revision (default: HEAD)",
+    )
+    draft_parser.add_argument(
+        "--patch",
+        type=Path,
+        required=True,
+        help="textual Git patch to inspect",
+    )
+    draft_parser.add_argument(
+        "--issue",
+        type=Path,
+        required=True,
+        help="UTF-8 issue description",
+    )
+    draft_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="new JSON artifact path; existing files are never overwritten",
+    )
     verify_parser = subparsers.add_parser(
         "verify", help="verify a proposed textual Git patch"
     )
@@ -73,6 +145,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
     replay_differences: tuple[str, ...] = ()
     try:
+        if arguments.command == "draft-requirements":
+            draft_result = _draft_patch_requirements(
+                repository=arguments.repo.resolve(),
+                base_revision=arguments.base,
+                patch_file=arguments.patch,
+                issue_file=arguments.issue,
+                output_file=arguments.output,
+            )
+            print(f"Draft: {draft_result.output_file}")
+            print(
+                f"Candidates: {draft_result.candidate_count} "
+                "(review required; no candidate tests were generated or run)"
+            )
+            if draft_result.truncated:
+                print(
+                    "Warning: candidate extraction was truncated.",
+                    file=sys.stderr,
+                )
+            return
         if arguments.command == "verify":
             command_prefix = tuple(shlex.split(arguments.test_command))
             repository = arguments.repo.resolve()

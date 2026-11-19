@@ -30,6 +30,7 @@ from .models import (
     Outcome,
     RevisionResult as EvidenceRevisionResult,
 )
+from .patches import is_binary_patch
 from .plan import CandidateCase, EvidencePlan, load_evidence_plan, verify_base_sources
 from .runner import (
     CommandResult,
@@ -289,7 +290,7 @@ def verify(request: VerificationRequest) -> VerificationResult:
         max_bytes=_MAX_PATCH_BYTES,
         expected_sha256=request.expected_patch_sha256,
     )
-    if b"\0" in patch_bytes or b"GIT binary patch" in patch_bytes:
+    if is_binary_patch(patch_bytes):
         raise VerificationError("binary patches are outside the current MVP scope")
     try:
         patch_text = patch_bytes.decode("utf-8")

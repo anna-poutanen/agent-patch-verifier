@@ -45,10 +45,11 @@ jobs:
           from importlib.resources import files
           from patch_verifier import __version__
 
-          assert __version__ == "0.2.0"
+          assert __version__ == "0.3.0"
           schemas = files("patch_verifier").joinpath("schemas")
           assert schemas.joinpath("evidence-plan.schema.json").is_file()
           assert schemas.joinpath("context.schema.json").is_file()
           assert schemas.joinpath("manifest.schema.json").is_file()
+          assert schemas.joinpath("requirements-draft.schema.json").is_file()
           PY
           apv --version

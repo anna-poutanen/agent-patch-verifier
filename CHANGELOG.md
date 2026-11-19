@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 — 2026-11-19
+
+- Add deterministic, review-only requirement candidate extraction from issue
+  acceptance criteria, relevant base-side pytest assertions, and behavioral
+  docstrings.
+- Preserve exact source spans, UTF-8 excerpt hashes, intent, confidence,
+  rationale, and stable candidate identifiers without promoting candidates to
+  executable or accepted requirements.
+- Add `apv draft-requirements` and a versioned, provenance-bound JSON artifact
+  containing the base commit, patched tree, patch, issue, context, and changed
+  symbol identities, plus the Python runtime used for static parsing.
+- Bound issue, source, AST, assertion, candidate, diagnostic, and output work;
+  fail closed on unsafe paths, symlinks, malformed encodings, and ambiguous
+  context.
+- Exclude current/broken-behavior prose and skipped or expected-failure tests
+  from candidate contracts, and propagate base-context omissions into the
+  review artifact.
+- Add adversarial benchmark fixtures for misleading prose, preservation
+  contracts, parametrization, duplicate definitions, dynamic calls, and
+  resource exhaustion.
+- Bound timeout pipe cleanup across stdout and stderr so an escaped descendant
+  cannot multiply cleanup delays by retaining both descriptors.
+
 ## 0.2.0 — 2026-11-18
 
 - Add deterministic base and patched repository-context collection for changed

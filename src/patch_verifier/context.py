@@ -11,9 +11,11 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from enum import Enum
+import io
 from itertools import islice
 import os
 from pathlib import Path, PurePosixPath
+import tokenize
 from typing import Any, Iterable
 
 from patch_verifier.change_analysis import ChangedSymbol, SourceSpan
@@ -22,6 +24,9 @@ from patch_verifier.change_analysis import ChangedSymbol, SourceSpan
 _MAX_FILE_BYTES = 2_000_000
 _MAX_PYTHON_FILES = 5_000
 _MAX_TOTAL_SOURCE_BYTES = 20_000_000
+_MAX_SOURCE_TOKENS = 100_000
+_MAX_AST_NODES = 100_000
+_MAX_ANALYSIS_RECORDS = 100_000
 _MAX_EXCERPT_CHARS = 4_000
 _MAX_ITEMS_PER_SYMBOL = 100
 _MAX_CHANGED_SYMBOLS = 200
@@ -257,6 +262,10 @@ class _CandidatePool:
     limit: int
     items: dict[tuple[object, ...], _Candidate] = field(default_factory=dict)
     truncated: bool = False
+
+
+class _AnalysisRecordLimitExceeded(Exception):
+    """The repository-wide retained static-analysis record budget is exhausted."""
 
 
 _STATIC_LIMITATIONS = (
@@ -500,7 +509,37 @@ def _index_repository(
     indexed: list[_PythonFile] = []
     total_source_bytes = 0
     source_limit_reported = False
+    remaining_ast_nodes = _MAX_AST_NODES
+    remaining_analysis_records = _MAX_ANALYSIS_RECORDS
     for relative, path in paths:
+        if remaining_ast_nodes == 0:
+            _append_context_diagnostic(
+                diagnostics,
+                ContextDiagnostic(
+                    code="ast_node_limit_reached",
+                    path=".",
+                    message=(
+                        "repository static analysis is limited to "
+                        f"{_MAX_AST_NODES} retained AST nodes; remaining files "
+                        "were omitted in deterministic path order"
+                    ),
+                ),
+            )
+            break
+        if remaining_analysis_records == 0:
+            _append_context_diagnostic(
+                diagnostics,
+                ContextDiagnostic(
+                    code="analysis_record_limit_reached",
+                    path=".",
+                    message=(
+                        "repository static analysis is limited to "
+                        f"{_MAX_ANALYSIS_RECORDS} retained analysis records; "
+                        "remaining files were omitted in deterministic path order"
+                    ),
+                ),
+            )
+            break
         try:
             with path.open("rb") as source_file:
                 source_bytes = source_file.read(_MAX_FILE_BYTES + 1)
@@ -533,6 +572,19 @@ def _index_repository(
                 continue
             total_source_bytes += len(source_bytes)
             source = source_bytes.decode("utf-8")
+            if _source_token_limit_exceeded(source):
+                _append_context_diagnostic(
+                    diagnostics,
+                    ContextDiagnostic(
+                        code="source_token_limit_reached",
+                        path=relative,
+                        message=(
+                            "file exceeds the "
+                            f"{_MAX_SOURCE_TOKENS}-token pre-parse analysis limit"
+                        ),
+                    ),
+                )
+                continue
             tree = ast.parse(source, filename=relative)
         except RecursionError:
             _append_context_diagnostic(
@@ -566,11 +618,52 @@ def _index_repository(
             )
             continue
 
+        ast_node_count = _bounded_ast_node_count(tree, remaining_ast_nodes)
+        if ast_node_count is None:
+            _append_context_diagnostic(
+                diagnostics,
+                ContextDiagnostic(
+                    code="ast_node_limit_reached",
+                    path=relative,
+                    message=(
+                        "repository static analysis is limited to "
+                        f"{_MAX_AST_NODES} retained AST nodes; this file and "
+                        "remaining files were omitted in deterministic path order"
+                    ),
+                ),
+            )
+            break
+
         module = _module_name(relative)
         try:
-            definitions, imports, calls, bindings = _analyze_tree(
-                tree, source, module, relative
+            (
+                definitions,
+                imports,
+                calls,
+                bindings,
+                analysis_record_count,
+            ) = _analyze_tree(
+                tree,
+                source,
+                module,
+                relative,
+                record_limit=remaining_analysis_records,
             )
+        except _AnalysisRecordLimitExceeded:
+            _append_context_diagnostic(
+                diagnostics,
+                ContextDiagnostic(
+                    code="analysis_record_limit_reached",
+                    path=relative,
+                    message=(
+                        "repository static analysis is limited to "
+                        f"{_MAX_ANALYSIS_RECORDS} retained analysis records; "
+                        "this file and remaining files were omitted in "
+                        "deterministic path order"
+                    ),
+                ),
+            )
+            break
         except RecursionError:
             _append_context_diagnostic(
                 diagnostics,
@@ -581,6 +674,8 @@ def _index_repository(
                 )
             )
             continue
+        remaining_ast_nodes -= ast_node_count
+        remaining_analysis_records -= analysis_record_count
         indexed.append(
             _PythonFile(
                 path=relative,
@@ -599,22 +694,64 @@ def _index_repository(
     return tuple(indexed), diagnostics
 
 
+def _source_token_limit_exceeded(source: str) -> bool:
+    """Return whether ``source`` exceeds the allocation-safe parse gate.
+
+    Invalid token streams are passed through so ``ast.parse`` can preserve the
+    existing, more useful syntax-error diagnostic.
+    """
+
+    source_stream = io.StringIO(source)
+    try:
+        for token_count, _ in enumerate(
+            tokenize.generate_tokens(source_stream.readline), start=1
+        ):
+            if token_count > _MAX_SOURCE_TOKENS:
+                return True
+    except (IndentationError, tokenize.TokenError):
+        return False
+    finally:
+        source_stream.close()
+    return False
+
+
+def _bounded_ast_node_count(tree: ast.AST, limit: int) -> int | None:
+    """Count AST nodes without traversing beyond the remaining global budget."""
+
+    count = 0
+    for _ in ast.walk(tree):
+        count += 1
+        if count > limit:
+            return None
+    return count
+
+
 def _analyze_tree(
     tree: ast.Module,
     source: str,
     module: str,
     path: str,
+    *,
+    record_limit: int,
 ) -> tuple[
     tuple[_Definition, ...],
     tuple[_ImportRecord, ...],
     tuple[_CallRecord, ...],
     tuple[_NameBinding, ...],
+    int,
 ]:
     definitions: list[_Definition] = []
     imports: list[_ImportRecord] = []
     calls: list[_CallRecord] = []
     bindings: list[_NameBinding] = []
     occurrences: dict[tuple[str, str], int] = {}
+    record_count = 0
+
+    def reserve_records(count: int = 1) -> None:
+        nonlocal record_count
+        if count > record_limit - record_count:
+            raise _AnalysisRecordLimitExceeded
+        record_count += count
 
     def visit(
         node: ast.AST,
@@ -638,6 +775,12 @@ def _analyze_tree(
             occurrence = occurrences.get(identity, 0) + 1
             occurrences[identity] = occurrence
             decorator_lines = [item.lineno for item in node.decorator_list]
+            arguments = (
+                _function_arguments(node.args)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else ()
+            )
+            reserve_records(2 + len(arguments))
             bindings.append(
                 _NameBinding(
                     owner=owner,
@@ -659,16 +802,15 @@ def _analyze_tree(
             )
             next_parents = (*parents, node.name)
             next_owner = qualified_name
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for argument in _function_arguments(node.args):
-                    bindings.append(
-                        _NameBinding(
-                            owner=qualified_name,
-                            name=argument.arg,
-                            kind="parameter",
-                            line=argument.lineno,
-                        )
+            for argument in arguments:
+                bindings.append(
+                    _NameBinding(
+                        owner=qualified_name,
+                        name=argument.arg,
+                        kind="parameter",
+                        line=argument.lineno,
                     )
+                )
         elif isinstance(node, ast.Lambda):
             next_lambda_parameters = lambda_parameters | frozenset(
                 argument.arg for argument in _function_arguments(node.args)
@@ -676,6 +818,7 @@ def _analyze_tree(
 
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             import_bindings, wildcard = _import_bindings(node, module, path)
+            reserve_records(1 + len(import_bindings))
             imports.append(
                 _ImportRecord(
                     start=node.lineno,
@@ -689,6 +832,7 @@ def _analyze_tree(
         elif isinstance(node, ast.Name) and isinstance(
             node.ctx, (ast.Store, ast.Del)
         ):
+            reserve_records()
             bindings.append(
                 _NameBinding(
                     owner=owner,
@@ -698,6 +842,7 @@ def _analyze_tree(
                 )
             )
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            reserve_records(len(node.names))
             for name in node.names:
                 bindings.append(
                     _NameBinding(
@@ -712,6 +857,7 @@ def _analyze_tree(
                     )
                 )
         elif isinstance(node, ast.ExceptHandler) and node.name:
+            reserve_records()
             bindings.append(
                 _NameBinding(
                     owner=owner,
@@ -721,6 +867,7 @@ def _analyze_tree(
                 )
             )
         elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            reserve_records()
             bindings.append(
                 _NameBinding(
                     owner=owner,
@@ -730,6 +877,7 @@ def _analyze_tree(
                 )
             )
         elif isinstance(node, ast.MatchMapping) and node.rest:
+            reserve_records()
             bindings.append(
                 _NameBinding(
                     owner=owner,
@@ -741,6 +889,7 @@ def _analyze_tree(
         elif isinstance(node, ast.Call):
             target = _dotted_expression(node.func)
             if target:
+                reserve_records()
                 calls.append(
                     _CallRecord(
                         start=node.lineno,
@@ -771,6 +920,7 @@ def _analyze_tree(
                 ),
             )
         ),
+        record_count,
     )
 
 

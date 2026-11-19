@@ -692,6 +692,74 @@ def test_total_source_bytes_are_bounded_and_diagnosed(
     )
 
 
+def test_source_token_limit_rejects_file_before_ast_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path, "module.py", "value = 1\n")
+    monkeypatch.setattr(context_module, "_MAX_SOURCE_TOKENS", 1)
+
+    def unexpected_parse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("token-heavy source reached ast.parse")
+
+    monkeypatch.setattr(context_module.ast, "parse", unexpected_parse)
+
+    result = collect_repository_context(
+        tmp_path, [changed_symbol("module.py", "value")]
+    )
+
+    assert result.symbols[0].items == ()
+    diagnostic = next(
+        item
+        for item in result.diagnostics
+        if item.code == "source_token_limit_reached"
+    )
+    assert diagnostic.path == "module.py"
+    assert "1-token" in diagnostic.message
+
+
+def test_ast_node_budget_is_global_and_retains_only_a_deterministic_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path, "a.py", "def alpha():\n    return 1\n")
+    write(tmp_path, "b.py", "def beta():\n    return 2\n")
+    monkeypatch.setattr(context_module, "_MAX_AST_NODES", 5)
+
+    result = collect_repository_context(
+        tmp_path,
+        [changed_symbol("b.py", "beta"), changed_symbol("a.py", "alpha")],
+    )
+
+    assert result.symbols[0].items
+    assert result.symbols[1].items == ()
+    diagnostic = next(
+        item
+        for item in result.diagnostics
+        if item.code == "ast_node_limit_reached"
+    )
+    assert diagnostic.path == "."
+    assert "5 retained AST nodes" in diagnostic.message
+
+
+def test_analysis_record_budget_rejects_a_file_before_records_are_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path, "module.py", "def target(value):\n    return value\n")
+    monkeypatch.setattr(context_module, "_MAX_ANALYSIS_RECORDS", 2)
+
+    result = collect_repository_context(
+        tmp_path, [changed_symbol("module.py", "target")]
+    )
+
+    assert result.symbols[0].items == ()
+    diagnostic = next(
+        item
+        for item in result.diagnostics
+        if item.code == "analysis_record_limit_reached"
+    )
+    assert diagnostic.path == "module.py"
+    assert "2 retained analysis records" in diagnostic.message
+
+
 def test_candidate_pool_is_bounded_before_final_ranking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

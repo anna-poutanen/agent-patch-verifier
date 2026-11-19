@@ -33,14 +33,29 @@ whether an observed transition proves a regression.
 - Avoid treating context as classification evidence or implying a complete
   call graph.
 
-## Milestone 2: requirement extraction
+## Milestone 2: requirement extraction — in progress
 
-- Extract candidate requirements from the supplied issue, base documentation,
-  and pre-existing tests.
-- Preserve exact source spans and excerpts.
-- Detect conflicts between issue intent and existing contracts.
-- Require human review or explicit acceptance before inferred claims can be
-  promoted to strong evidence.
+Delivered in the first increment:
+
+- Extract review-only candidate requirements from conservative issue criteria,
+  relevant base documentation, and statically selected pre-existing pytest
+  assertions.
+- Preserve exact source spans, excerpts, hashes, confidence, rationale, and
+  requested-versus-preservation intent.
+- Bind portable draft artifacts to the exact base commit, patched tree, patch,
+  issue, repository context, changed symbols, and tool version.
+- Keep every candidate in `requires_review`; drafting cannot execute tests or
+  promote a candidate to a strong requirement.
+- Exercise misleading prose, dynamic calls, duplicate definitions,
+  parametrization, unrelated tests, and resource limits in a benchmark corpus.
+
+Remaining in this milestone:
+
+- Detect and present potential conflicts between issue intent and existing
+  contracts without claiming a semantic contradiction that static analysis
+  cannot establish.
+- Add an explicit human acceptance/editing workflow that produces requirements
+  suitable for an evidence plan.
 
 ## Milestone 3: model-driven candidate generation
 
