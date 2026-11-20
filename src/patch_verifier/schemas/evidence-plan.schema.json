@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-patch-verifier:evidence-plan:1",
+  "$id": "urn:agent-patch-verifier:evidence-plan:2",
   "title": "Agent Patch Verifier evidence plan",
   "type": "object",
   "additionalProperties": false,
@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1
+      "enum": [1, 2]
     },
     "requirements": {
       "type": "array",
@@ -123,10 +123,38 @@
           },
           "rationale": {
             "type": "string"
+          },
+          "test_sha256": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
           }
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": 2}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "cases": {
+            "items": {"required": ["test_sha256"]}
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "cases": {
+            "items": {"not": {"required": ["test_sha256"]}}
+          }
+        }
+      }
+    }
+  ]
 }
 

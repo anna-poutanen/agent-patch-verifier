@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 import ast
+import codecs
 from dataclasses import dataclass, field
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
+import tokenize
 from typing import Any, Mapping
+import unicodedata
 
 from .models import ProvenanceTier, Requirement
+from .safe_io import BoundedFileReadError, read_bounded_regular_file
 
 
 class PlanError(ValueError):
     """Raised when an evidence plan is incomplete or internally inconsistent."""
 
 
+class _DuplicateKeyError(ValueError):
+    pass
+
+
 _NODE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _PLAN_KEYS = {"schema_version", "requirements", "cases"}
 _REQUIREMENT_KEYS = {"id", "statement", "kind", "provenance", "source", "excerpt"}
-_CASE_KEYS = {"id", "requirement_id", "test_file", "node", "rationale"}
+_CASE_KEYS_V1 = {"id", "requirement_id", "test_file", "node", "rationale"}
+_CASE_KEYS_V2 = _CASE_KEYS_V1 | {"test_sha256"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_REQUIREMENTS = 200
 _MAX_CASES = 50
 _MAX_ID_LENGTH = 64
@@ -42,6 +54,7 @@ class CandidateCase:
     node: str
     rationale: str
     source_bytes: bytes = field(repr=False)
+    declared_source_sha256: str | None = None
 
     @property
     def source_sha256(self) -> str:
@@ -50,13 +63,16 @@ class CandidateCase:
         return hashlib.sha256(self.source_bytes).hexdigest()
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        payload = {
             "id": self.id,
             "requirement_id": self.requirement_id,
             "test_file": str(self.source_file),
             "node": self.node,
             "rationale": self.rationale,
         }
+        if self.declared_source_sha256 is not None:
+            payload["test_sha256"] = self.declared_source_sha256
+        return payload
 
 
 @dataclass(frozen=True)
@@ -105,15 +121,28 @@ def load_evidence_plan(
     *,
     issue_text: str,
     document_bytes: bytes | None = None,
+    candidate_source_documents: Mapping[str, bytes] | None = None,
 ) -> EvidencePlan:
     """Load and validate a JSON evidence plan.
 
     Candidate paths are resolved relative to the plan file. Explicit
     requirements must cite ``issue:<line>`` and quote text that occurs at that
     line in the supplied issue description.
+
+    ``candidate_source_documents`` is an optional exact, relative-path keyed
+    snapshot for callers that already froze candidate bytes through a secure
+    file-descriptor boundary.  When supplied, candidate paths are never opened
+    or resolved through the live filesystem; the map must contain exactly the
+    files named by the plan.  Omitting it preserves the direct loader's legacy
+    filesystem behavior.
     """
 
-    plan_path = path.resolve()
+    frozen_sources = _freeze_candidate_source_documents(
+        candidate_source_documents
+    )
+    # Preserve the final path component so the bounded reader can reject a
+    # symlink instead of silently following it before the secure open.
+    plan_path = Path(os.path.abspath(path))
     try:
         if document_bytes is None:
             document_bytes = _read_bounded_bytes(
@@ -126,17 +155,34 @@ def load_evidence_plan(
                 "evidence plan exceeds the "
                 f"{_MAX_PLAN_DOCUMENT_BYTES}-byte limit"
             )
-        raw = json.loads(document_bytes.decode("utf-8"))
+        raw = json.loads(
+            document_bytes.decode("utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateKeyError as exc:
+        raise PlanError(f"evidence plan contains {exc}") from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PlanError(f"evidence plan is not valid JSON: {exc}") from exc
+    except PlanError:
+        raise
+    except (MemoryError, RecursionError, ValueError) as exc:
+        raise PlanError("evidence plan is not safely parseable JSON") from exc
     if not isinstance(raw, Mapping):
         raise PlanError("evidence plan must be a JSON object")
     unknown = set(raw) - _PLAN_KEYS
     if unknown:
         raise PlanError(f"evidence plan has unknown fields {sorted(unknown)}")
-    schema_version = raw.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != 1:
-        raise PlanError("evidence plan schema_version must be 1")
+    raw_schema_version = raw.get("schema_version")
+    if (
+        isinstance(raw_schema_version, bool)
+        or not isinstance(raw_schema_version, (int, float))
+        or raw_schema_version not in {1, 2}
+    ):
+        raise PlanError("evidence plan schema_version must be 1 or 2")
+    # JSON Schema treats mathematically integral JSON numbers such as ``2.0``
+    # as integers. Normalize that published representation to a Python int.
+    schema_version = int(raw_schema_version)
 
     requirement_items = _object_list(
         raw, "requirements", max_items=_MAX_REQUIREMENTS
@@ -144,9 +190,25 @@ def load_evidence_plan(
     case_items = _object_list(raw, "cases", max_items=_MAX_CASES)
     requirements = tuple(_requirement(item) for item in requirement_items)
     source_cache: dict[Path, bytes] = {}
+    used_frozen_sources: set[str] = set()
     cases = tuple(
-        _case(item, plan_path.parent, source_cache) for item in case_items
+        _case(
+            item,
+            plan_path.parent,
+            source_cache,
+            schema_version=schema_version,
+            frozen_sources=frozen_sources,
+            used_frozen_sources=used_frozen_sources,
+        )
+        for item in case_items
     )
+    if frozen_sources is not None:
+        extra_sources = sorted(set(frozen_sources) - used_frozen_sources)
+        if extra_sources:
+            raise PlanError(
+                "frozen candidate source map contains an unreferenced path: "
+                f"{extra_sources[0]!r}"
+            )
 
     _require_unique((item.id for item in requirements), "requirement")
     _require_unique((item.id for item in cases), "case")
@@ -178,7 +240,60 @@ def load_evidence_plan(
         raise PlanError("evidence plan must contain at least one requirement")
     if not cases:
         raise PlanError("evidence plan must contain at least one case")
-    return EvidencePlan(1, requirements, cases)
+    return EvidencePlan(schema_version, requirements, cases)
+
+
+def _object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value}")
+
+
+def _freeze_candidate_source_documents(
+    documents: Mapping[str, bytes] | None,
+) -> dict[str, bytes] | None:
+    if documents is None:
+        return None
+    if not isinstance(documents, Mapping):
+        raise PlanError("candidate_source_documents must be a path-to-bytes mapping")
+    if len(documents) > _MAX_CASES:
+        raise PlanError(
+            "candidate_source_documents must contain at most "
+            f"{_MAX_CASES} entries"
+        )
+    frozen: dict[str, bytes] = {}
+    total_bytes = 0
+    for path, document in documents.items():
+        if not isinstance(path, str) or not path:
+            raise PlanError(
+                "candidate_source_documents keys must be non-empty strings"
+            )
+        if not isinstance(document, bytes):
+            raise PlanError(
+                f"frozen candidate source {path!r} must be supplied as exact bytes"
+            )
+        if len(document) > _MAX_CANDIDATE_FILE_BYTES:
+            raise PlanError(
+                f"frozen candidate source {path!r} exceeds the "
+                f"{_MAX_CANDIDATE_FILE_BYTES}-byte limit"
+            )
+        total_bytes += len(document)
+        if total_bytes > _MAX_TOTAL_CANDIDATE_BYTES:
+            raise PlanError(
+                "frozen candidate sources exceed the "
+                f"{_MAX_TOTAL_CANDIDATE_BYTES}-byte aggregate limit"
+            )
+        frozen[path] = document
+    return frozen
 
 
 def verify_base_sources(plan: EvidencePlan, base_root: Path) -> None:
@@ -284,11 +399,19 @@ def _case(
     raw: Mapping[str, Any],
     plan_root: Path,
     source_cache: dict[Path, bytes],
+    *,
+    schema_version: int,
+    frozen_sources: Mapping[str, bytes] | None,
+    used_frozen_sources: set[str],
 ) -> CandidateCase:
-    unknown = set(raw) - _CASE_KEYS
+    allowed_keys = _CASE_KEYS_V2 if schema_version == 2 else _CASE_KEYS_V1
+    unknown = set(raw) - allowed_keys
     if unknown:
         raise PlanError(f"invalid case: unknown fields {sorted(unknown)}")
-    for key in ("id", "requirement_id", "test_file", "node"):
+    required_keys = ["id", "requirement_id", "test_file", "node"]
+    if schema_version == 2:
+        required_keys.append("test_sha256")
+    for key in required_keys:
         if not isinstance(raw.get(key), str):
             raise PlanError(f"invalid case: {key} must be a string")
     if "rationale" in raw and not isinstance(raw.get("rationale"), str):
@@ -299,6 +422,9 @@ def _case(
         source_value = str(raw["test_file"])
         node = str(raw["node"]).strip()
         rationale = str(raw.get("rationale", "")).strip()
+        declared_source_sha256 = (
+            str(raw["test_sha256"]) if schema_version == 2 else None
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise PlanError(f"invalid case: {exc}") from exc
     if not case_id:
@@ -313,25 +439,54 @@ def _case(
         raise PlanError(f"case {case_id!r} requirement_id must not be empty")
     if not _NODE_RE.fullmatch(node):
         raise PlanError(f"case {case_id!r} has an invalid pytest node {node!r}")
+    if (
+        declared_source_sha256 is not None
+        and not _SHA256_RE.fullmatch(declared_source_sha256)
+    ):
+        raise PlanError(
+            f"case {case_id!r} test_sha256 must be a lowercase SHA-256 digest"
+        )
     source_input = Path(source_value)
     if source_input.is_absolute():
         raise PlanError(f"case {case_id!r} test file must be a relative path")
-    source_file = (plan_root / source_input).resolve()
+    source_file = Path(os.path.abspath(plan_root / source_input))
     try:
-        source_file.relative_to(plan_root.resolve())
+        source_file.relative_to(plan_root)
     except ValueError as exc:
         raise PlanError(
             f"case {case_id!r} test file must be inside the evidence-plan directory"
         ) from exc
     if source_file.suffix != ".py":
         raise PlanError(f"case {case_id!r} test file must end in .py")
+    supplied_source: bytes | None = None
+    if frozen_sources is not None:
+        supplied_source = frozen_sources.get(source_value)
+        if supplied_source is None:
+            raise PlanError(
+                f"case {case_id!r} test file {source_value!r} is missing from "
+                "the frozen candidate source map"
+            )
+        used_frozen_sources.add(source_value)
     source_bytes = source_cache.get(source_file)
-    if source_bytes is None:
-        source_bytes = _read_bounded_bytes(
-            source_file,
-            max_bytes=_MAX_CANDIDATE_FILE_BYTES,
-            label=f"case {case_id!r} test file {source_value!r}",
+    if source_bytes is not None and (
+        supplied_source is not None and supplied_source != source_bytes
+    ):
+        raise PlanError(
+            f"case {case_id!r} frozen test path aliases another path with "
+            "different bytes"
         )
+    if source_bytes is None:
+        source_bytes = (
+            supplied_source
+            if supplied_source is not None
+            else _read_bounded_bytes(
+                source_file,
+                max_bytes=_MAX_CANDIDATE_FILE_BYTES,
+                label=f"case {case_id!r} test file {source_value!r}",
+                root=plan_root,
+            )
+        )
+        assert source_bytes is not None
         total_candidate_bytes = sum(
             len(contents) for contents in source_cache.values()
         ) + len(source_bytes)
@@ -341,6 +496,15 @@ def _case(
                 f"{_MAX_TOTAL_CANDIDATE_BYTES}-byte aggregate limit"
             )
         source_cache[source_file] = source_bytes
+    observed_source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if (
+        declared_source_sha256 is not None
+        and declared_source_sha256 != observed_source_sha256
+    ):
+        raise PlanError(
+            f"case {case_id!r} test file hash mismatch: expected "
+            f"{declared_source_sha256}, observed {observed_source_sha256}"
+        )
     validate_candidate_test_source(
         source_bytes,
         case_id=case_id,
@@ -354,20 +518,25 @@ def _case(
         node,
         rationale,
         source_bytes,
+        declared_source_sha256,
     )
 
 
-def _read_bounded_bytes(path: Path, *, max_bytes: int, label: str) -> bytes:
+def _read_bounded_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    root: Path | None = None,
+) -> bytes:
     """Read one local artifact without allocating beyond its byte budget."""
 
     try:
-        with path.open("rb") as stream:
-            contents = stream.read(max_bytes + 1)
-    except OSError as exc:
+        return read_bounded_regular_file(path, max_bytes=max_bytes, root=root)
+    except BoundedFileReadError as exc:
+        if f"exceeds the {max_bytes}-byte limit" in str(exc):
+            raise PlanError(f"{label} exceeds the {max_bytes}-byte limit") from exc
         raise PlanError(f"cannot read {label}: {exc}") from exc
-    if len(contents) > max_bytes:
-        raise PlanError(f"{label} exceeds the {max_bytes}-byte limit")
-    return contents
 
 
 def _require_unique(values: object, label: str) -> None:
@@ -379,9 +548,16 @@ def _require_unique(values: object, label: str) -> None:
 
 
 def _require_unique_case_nodes(cases: tuple[CandidateCase, ...]) -> None:
-    seen: dict[tuple[Path, str], str] = {}
+    seen: dict[tuple[str, str], str] = {}
     for case in cases:
-        key = (case.source_file, case.node)
+        # Case-insensitive filesystems may preserve the caller's spelling in
+        # ``resolve()`` even when two paths identify the same file. Treat such
+        # aliases as one portable test path so a node cannot support two
+        # requirements merely by changing filename case.
+        portable_path = unicodedata.normalize(
+            "NFC", case.source_file.as_posix()
+        ).casefold()
+        key = (portable_path, case.node)
         previous = seen.get(key)
         if previous is not None:
             raise PlanError(
@@ -426,8 +602,21 @@ def validate_candidate_test_source(
         raise PlanError("candidate test source_name must be a non-empty string")
 
     try:
+        detected_encoding, _ = tokenize.detect_encoding(
+            io.BytesIO(source_bytes).readline
+        )
+        if codecs.lookup(detected_encoding).name != "utf-8":
+            raise PlanError(
+                f"case {case_id!r} test source must declare UTF-8 encoding"
+            )
         source = source_bytes.decode("utf-8")
         tree = ast.parse(source, filename=source_name)
+    except PlanError:
+        raise
+    except LookupError as exc:
+        raise PlanError(
+            f"case {case_id!r} test source declares an unknown encoding"
+        ) from exc
     except (MemoryError, RecursionError, UnicodeError, SyntaxError, ValueError) as exc:
         detail = str(exc) or type(exc).__name__
         raise PlanError(

@@ -77,18 +77,41 @@ whether an observed transition proves a regression.
   response neither writes candidate files nor imports, collects, executes, or
   converts generated code into an evidence plan.
 
-## Milestone 3b: reviewed materialization and isolated preflight — deferred
+## Milestone 3b: reviewed proposal materialization — complete
 
 - Define explicit human decisions for accepting, editing, or rejecting test
   proposals without weakening their reviewed-requirement bindings.
-- Convert only accepted proposals into an evidence plan and materialize exact
-  reviewed bytes for the existing dual-execution verifier.
-- Design an isolation boundary for pytest collection and import preflight.
-  Dynamic collection is deliberately absent from Milestone 3a because
-  unreviewed Python cannot be authenticated before it may execute in a
-  same-user local process.
-- After that boundary exists, validate pytest collection and allow a small,
-  bounded repair loop for collection and import errors.
+- Bind the review to the exact proposal artifact, reviewed requirements,
+  issue, generator response, and immutable proposal previews; require a
+  rationale for every terminal decision.
+- Revalidate edited source without importing it, derive a new content-based
+  case ID, and retain the original proposal ID and every decision in the final
+  audit artifact.
+- Convert only accepted and edited proposals into EvidencePlan v2 cases whose
+  `test_sha256` values bind exact reviewed candidate bytes.
+- Materialize candidates, issue, plan, and review audit into a new staging
+  directory; inventory every file and publish the completion manifest last.
+- Authenticate the complete staging inventory and cross-check its plan,
+  review, issue, candidate paths, and hashes before an explicit
+  `verify-materialized` handoff invokes the existing dual-execution verifier.
+- Keep proposal preparation, finalization, and materialization inert: none
+  imports, collects, or executes candidate Python.
+- Preserve strict legacy v1 loading for reviewed requirements, test proposals,
+  and EvidencePlans while requiring the v2 issue and candidate-hash bindings
+  for new reviewed materializations.
+
+## Milestone 3c: isolated collection preflight and repair — deferred
+
+- Design an OS- or container-level isolation boundary for pytest collection
+  and import preflight. Pytest collection can execute module-level, plugin, and
+  fixture code, so same-user static validation is not a security boundary.
+- After that boundary exists, dynamically validate collection and allow a
+  small, bounded model-assisted repair loop for collection and import errors.
+- Preserve the explicit human decision and exact-byte audit when a repair
+  changes candidate source; a model must not silently revise accepted code.
+- Decide how a future evidence-bundle schema should carry the staging review
+  audit. Bundle v2 currently retains effective tests and requirements but not
+  the reviewed-proposal or materialization artifacts.
 
 ## Milestone 4: minimization and evaluation
 

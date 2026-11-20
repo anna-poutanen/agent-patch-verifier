@@ -374,12 +374,24 @@ def validate_reviewed_requirements_artifact(payload: object) -> None:
 
     _validate_schema(payload, _final_validator(), root="reviewed_requirements")
     assert isinstance(payload, Mapping)
+    if type(payload["schema_version"]) is not int:
+        raise ValueError("reviewed_requirements.schema_version: expected integer")
     requirements = payload["requirements"]
     audit = payload["audit"]
     draft = payload["draft"]
     assert isinstance(requirements, list)
     assert isinstance(audit, Mapping)
     assert isinstance(draft, Mapping)
+    review_binding = payload["review"]
+    assert isinstance(review_binding, Mapping)
+    for label, value in (
+        ("draft.schema_version", draft["schema_version"]),
+        ("review.schema_version", review_binding["schema_version"]),
+    ):
+        if type(value) is not int:
+            raise ValueError(
+                f"reviewed_requirements.{label}: expected integer"
+            )
     decisions = audit["decisions"]
     hints = audit["conflict_hints"]
     conflict_analysis = audit["conflict_analysis"]

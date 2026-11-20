@@ -42,6 +42,8 @@ _MAX_REVIEWED_REQUIREMENTS_BYTES = 24 * 1024 * 1024
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_TOTAL_SOURCE_BYTES = 20 * 1024 * 1024
 _MAX_RATIONALE_BYTES = 16_000
+_MAX_PATH_COMPONENTS = 32
+_MAX_UNIQUE_DIRECTORIES = 256
 _CATEGORY_ORDER = {
     "requested": 0,
     "preservation": 1,
@@ -67,6 +69,12 @@ _WINDOWS_RESERVED_COMPONENTS = {
     "prn",
     *(f"com{index}" for index in range(1, 10)),
     *(f"lpt{index}" for index in range(1, 10)),
+}
+_MATERIALIZATION_RESERVED_ROOTS = {
+    "evidence-plan.json",
+    "issue.md",
+    "materialization.json",
+    "reviewed-test-proposals.json",
 }
 
 
@@ -529,7 +537,10 @@ def build_test_proposal_artifact(
         proposal["requirement_id"] for proposal in normalized
     }
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        # Proposal artifacts inherit the reviewed-requirements generation.
+        # Only a v2 chain carries the exact issue binding required by the
+        # review/materialization workflow; legacy v1 remains inspection-only.
+        "schema_version": reviewed["schema_version"],
         "artifact_type": "test-proposals",
         "review_status": "requires_review",
         "reviewed_requirements": {
@@ -700,6 +711,10 @@ def _validate_semantics(
     reviewed: Mapping[str, Any],
     generator_response_document: bytes | None,
 ) -> None:
+    if type(payload["schema_version"]) is not int:
+        raise TestProposalError(
+            "test_proposals.schema_version: expected integer"
+        )
     binding = payload["reviewed_requirements"]
     generator = payload["generator"]
     generator_response = payload["generator_response"]
@@ -710,6 +725,15 @@ def _validate_semantics(
     assert isinstance(generator_response, Mapping)
     assert isinstance(coverage, Mapping)
     assert isinstance(proposals, list)
+    if type(binding["schema_version"]) is not int:
+        raise TestProposalError(
+            "test_proposals.reviewed_requirements.schema_version: expected integer"
+        )
+    if payload["schema_version"] != binding["schema_version"]:
+        raise TestProposalError(
+            "test_proposals.schema_version: must match the bound "
+            "reviewed-requirements schema version"
+        )
     requirements = reviewed["requirements"]
     assert isinstance(requirements, list)
     expected_ids = [requirement["id"] for requirement in requirements]
@@ -741,6 +765,8 @@ def _validate_semantics(
     seen_ids: set[str] = set()
     seen_files: set[str] = set()
     seen_portable_files: dict[str, str] = {}
+    seen_portable_paths: list[tuple[tuple[str, ...], str]] = []
+    directory_spellings: dict[tuple[str, ...], tuple[str, ...]] = {}
     order_keys: list[tuple[object, ...]] = []
     total_source_bytes = 0
     for index, proposal in enumerate(proposals):
@@ -775,6 +801,7 @@ def _validate_semantics(
         _validate_safe_test_file(
             test_file,
             label=f"test_proposals.proposals[{index}].test_file",
+            materialization_safe=payload["schema_version"] == 2,
         )
         portable_key = test_file.casefold()
         previous_spelling = seen_portable_files.get(portable_key)
@@ -784,6 +811,39 @@ def _validate_semantics(
                 f"collision with {previous_spelling!r}"
             )
         seen_portable_files[portable_key] = test_file
+        if payload["schema_version"] == 2:
+            path_parts = tuple(PurePosixPath(test_file).parts)
+            portable_parts = tuple(part.casefold() for part in path_parts)
+            for previous_parts, previous_path in seen_portable_paths:
+                common_length = min(len(previous_parts), len(portable_parts))
+                if (
+                    previous_parts[:common_length]
+                    == portable_parts[:common_length]
+                    and len(previous_parts) != len(portable_parts)
+                ):
+                    raise TestProposalError(
+                        f"test_proposals.proposals[{index}].test_file: "
+                        f"file/directory path conflict with {previous_path!r}"
+                    )
+            seen_portable_paths.append((portable_parts, test_file))
+            for depth in range(1, len(path_parts)):
+                directory_key = portable_parts[:depth]
+                spelling = path_parts[:depth]
+                previous_spelling_parts = directory_spellings.get(directory_key)
+                if (
+                    previous_spelling_parts is not None
+                    and previous_spelling_parts != spelling
+                ):
+                    raise TestProposalError(
+                        f"test_proposals.proposals[{index}].test_file: portable "
+                        "directory spelling collision"
+                    )
+                directory_spellings[directory_key] = spelling
+                if len(directory_spellings) > _MAX_UNIQUE_DIRECTORIES:
+                    raise TestProposalError(
+                        "test_proposals.proposals: candidate paths exceed the "
+                        f"{_MAX_UNIQUE_DIRECTORIES}-directory limit"
+                    )
         _validate_text_field(
             rationale,
             label=f"test_proposals.proposals[{index}].rationale",
@@ -992,7 +1052,12 @@ def _proposal_order_key(proposal: Mapping[str, object]) -> tuple[object, ...]:
     )
 
 
-def _validate_safe_test_file(value: str, *, label: str) -> None:
+def _validate_safe_test_file(
+    value: str,
+    *,
+    label: str,
+    materialization_safe: bool = True,
+) -> None:
     if any(character in value for character in "\\\r\n\0"):
         raise TestProposalError(
             f"{label} must be a single-line POSIX path without backslashes or NUL"
@@ -1006,6 +1071,17 @@ def _validate_safe_test_file(value: str, *, label: str) -> None:
     ):
         raise TestProposalError(
             f"{label} must be a canonical safe relative .py path"
+        )
+    if materialization_safe and len(path.parts) > _MAX_PATH_COMPONENTS:
+        raise TestProposalError(
+            f"{label} must contain at most {_MAX_PATH_COMPONENTS} components"
+        )
+    if (
+        materialization_safe
+        and path.parts[0].casefold() in _MATERIALIZATION_RESERVED_ROOTS
+    ):
+        raise TestProposalError(
+            f"{label} uses a reserved materialization root {path.parts[0]!r}"
         )
     for component in path.parts:
         if not _PORTABLE_PATH_COMPONENT.fullmatch(component):

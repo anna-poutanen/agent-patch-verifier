@@ -321,9 +321,16 @@ def finalize_requirement_review(
         requirements.append(requirement.to_dict())
 
     result: dict[str, Any] = {
-        "schema_version": 1,
+        # v2 adds an exact issue binding.  v1 remains readable, but emitting
+        # the new field under the closed v1 contract would make otherwise
+        # valid artifacts unreadable by existing consumers.
+        "schema_version": 2,
         "artifact_type": "reviewed-requirements",
         "draft": dict(binding),
+        "issue": {
+            "sha256": draft["inputs"]["issue_sha256"],
+            "source": draft["inputs"]["issue_source"],
+        },
         "review": {
             "sha256": hashlib.sha256(review_bytes).hexdigest(),
             "schema_version": review["schema_version"],

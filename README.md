@@ -12,7 +12,7 @@ called a supported regression only when it checks a strongly sourced
 preservation requirement. A run with no finding is not proof that the patch is
 correct.
 
-The current development release is `0.5.0`.
+The current development release is `0.6.0`.
 
 ## Current status
 
@@ -39,6 +39,13 @@ This repository contains the first deterministic vertical slice:
 - provider-neutral import of structured test proposals into an exact-input-
   bound, deterministic `requires_review` artifact with stable case IDs,
   assertion provenance, and explicit reviewed-requirement coverage gaps;
+- exact-input-bound accept, edit, and reject review for every generated test
+  proposal, with revalidation and new content-derived IDs for edited cases;
+- deterministic, inert materialization of accepted candidate bytes, an
+  EvidencePlan v2, the exact issue, the complete review audit, and a
+  completion manifest whose hashes are checked before execution;
+- a separate `verify-materialized` handoff that is the only step in the
+  generated-test workflow that imports, collects, or executes candidate code;
 - a separately reviewable evidence-plan format for requirements and candidate
   tests;
 - fresh worktrees for every case and repeat, plus shell-free pytest execution
@@ -52,13 +59,16 @@ This repository contains the first deterministic vertical slice:
   and
 - hash-checked bundle reproduction with drift detection.
 
-Requirement drafting, explicit human review, and provider-neutral test-proposal
-import are available, but verification still consumes an evidence plan with
-independently reviewed pytest cases. A draft never becomes an oracle
-automatically and never runs as a test. Reviewed requirements can be supplied
-to a model adapter, and APV can normalize its structured response, but every
-proposal remains `requires_review`. APV does not yet collect, execute, or
-convert those proposals into an evidence plan.
+Requirement drafting, explicit human review, provider-neutral test-proposal
+import, proposal review, and inert materialization are available. A draft never
+becomes an oracle automatically and never runs as a test. Reviewed requirements
+can be supplied to a model adapter, and APV can normalize its structured
+response, but every proposal remains `requires_review` until a reviewer records
+a terminal decision. Preparation, finalization, and materialization do not
+import, collect, or execute candidate code. Only the separate, explicit
+`verify-materialized` command crosses that execution boundary. APV does not yet
+invoke a model, dynamically preflight pytest collection, or repair generated
+tests.
 
 ## Install for development
 
@@ -222,11 +232,126 @@ for the normalized artifact format.
 Import performs static UTF-8, Python-syntax, node, path, assertion-count, hash,
 and schema checks only. It does not write candidate files outside the JSON
 artifact, import generated modules, invoke pytest collection, execute target or
-test code, or convert proposals into an evidence plan. Dynamic collection is
-deliberately deferred: pytest collection can execute module-level Python, and
-unreviewed code cannot be authenticated before that execution in a same-user
-local process. A later milestone needs an explicit human-review and isolation
-boundary before collection or repair can be safe enough to add.
+test code, or convert proposals into an evidence plan. Release 0.6.0 emits
+test-proposals schema v2, which carries the exact issue binding inherited from
+reviewed-requirements schema v2. Legacy v1 artifacts remain readable for
+inspection, but they lack enough issue provenance to enter the materialization
+workflow.
+
+## Review and materialize test proposals
+
+Create an all-pending human decision ledger from the exact proposal chain:
+
+```bash
+apv prepare-test-review \
+  --proposals test-proposals.json \
+  --reviewed reviewed-requirements.json \
+  --issue issue.md \
+  --response generator-response.json \
+  --output test-proposal-review.json
+```
+
+`--response` is required when the proposal artifact binds exact generator
+response bytes and may be omitted for an artifact that records only its
+canonical response. The ledger repeats each proposal, linked requirement,
+assertion coordinates, and exact source beside an initial `pending` decision.
+For every proposal, a reviewer must choose one action:
+
+- `accept`: keep `replacement` as `null` and add a non-empty `rationale`;
+- `edit`: add a rationale and a `replacement` containing the revised
+  `test_file`, `node`, `rationale`, and complete `source`; or
+- `reject`: keep `replacement` as `null` and explain the rejection.
+
+An edit cannot change the linked requirement or proposal category. APV applies
+the same static path, syntax, node, assertion-count, and hash validation to the
+replacement, then derives a new case ID from its effective contents while
+retaining the original proposal ID in the audit trail.
+
+After every decision is terminal, finalize it against all of the exact inputs:
+
+```bash
+apv finalize-test-review \
+  --proposals test-proposals.json \
+  --reviewed reviewed-requirements.json \
+  --issue issue.md \
+  --response generator-response.json \
+  --review test-proposal-review.json \
+  --output reviewed-test-proposals.json
+```
+
+The final artifact records every reviewed requirement in its original order,
+only the accepted or edited effective cases, accepted and unaccepted coverage,
+and all decisions. An all-rejected review is a valid audit artifact, but it
+cannot produce an EvidencePlan because there is no case to execute. Neither
+review command imports, collects, or executes candidate code. The portable
+formats are
+[`test-proposal-review.schema.json`](src/patch_verifier/schemas/test-proposal-review.schema.json)
+and
+[`reviewed-test-proposals.schema.json`](src/patch_verifier/schemas/reviewed-test-proposals.schema.json).
+
+Materialize accepted candidates into a new, inert staging directory:
+
+```bash
+apv materialize-reviewed-tests \
+  --reviewed-tests reviewed-test-proposals.json \
+  --proposals test-proposals.json \
+  --reviewed reviewed-requirements.json \
+  --issue issue.md \
+  --review test-proposal-review.json \
+  --response generator-response.json \
+  --output-dir staged-tests
+```
+
+APV reauthenticates the complete chain and refuses an existing output path. It
+writes exact accepted source files, `issue.md`, `evidence-plan.json`, and
+`reviewed-test-proposals.json`, then publishes `materialization.json` last as
+the completion marker. EvidencePlan v2 binds each case to its candidate bytes
+with `test_sha256`; the completion manifest binds and inventories every staged
+file. Materialization still does not import, collect, or execute Python. See
+[`test-materialization.schema.json`](src/patch_verifier/schemas/test-materialization.schema.json)
+for the manifest contract. Secure materialization currently requires platform
+support for descriptor-relative directory operations, no-follow opens, and
+file-descriptor inventory. APV fails before creating the output directory when
+those primitives are unavailable.
+
+Verification and reproduction use the same fail-closed filesystem boundary for
+patches, issue text, EvidencePlans, candidate tests, bundle artifacts, and
+post-test JUnit reports. They require descriptor-relative directory traversal,
+no-follow opens, and non-blocking regular-file reads; APV refuses execution or
+replay when those primitives are unavailable. This currently excludes Windows
+from the secure execution and replay paths.
+
+## Verify reviewed materialization
+
+Execution requires a separate, explicit command:
+
+```bash
+apv verify-materialized \
+  --materialization staged-tests \
+  --repo /path/to/project \
+  --base HEAD \
+  --patch proposed.diff \
+  --output verified-run \
+  --repeat 3
+```
+
+Before execution, APV requires a complete staging inventory; verifies the
+manifest, issue, EvidencePlan, reviewed-proposal artifact, and candidate hashes;
+cross-checks their case, requirement, path, and source bindings; and freezes the
+authenticated issue, plan, and candidate bytes in memory for the verification
+request. Verification does not reopen those staging paths, so later path,
+symlink, or special-file replacement cannot change or block the authenticated
+handoff. The base revision and patch are supplied at this handoff rather than
+authenticated by the staging manifest. The command then invokes the same
+dual-revision verifier as `apv verify`.
+
+This handoff is a trust boundary, not a sandbox. Accepted code may still be
+incorrect or malicious. Pytest collection imports modules and can execute
+module-level code before a test body runs; the entire verification runs with
+the invoking user's filesystem, process, and network permissions. Inspect the
+staging directory and use an external container or OS sandbox when the code is
+not trusted. APV deliberately has no automatic collection preflight or model
+repair loop in this release.
 
 ## Evidence plan
 
@@ -234,7 +359,7 @@ An evidence plan links each pytest node to exactly one requirement:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "requirements": [
     {
       "id": "REQ-ZERO",
@@ -258,19 +383,25 @@ An evidence plan links each pytest node to exactly one requirement:
       "id": "CASE-ZERO",
       "requirement_id": "REQ-ZERO",
       "test_file": "candidate.py",
-      "node": "test_zero"
+      "node": "test_zero",
+      "test_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     {
       "id": "CASE-THREE",
       "requirement_id": "REQ-THREE",
       "test_file": "candidate.py",
-      "node": "test_three"
+      "node": "test_three",
+      "test_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   ]
 }
 ```
 
-`test_file` must remain inside the plan directory. Explicit requirements cite
+`test_file` must remain inside the plan directory. EvidencePlan v2 requires
+`test_sha256` to match the complete candidate file before static validation or
+execution; the same file therefore has the same hash in both example cases.
+Legacy v1 plans without candidate hashes remain readable for direct
+verification and bundle replay. Explicit requirements cite
 `issue:<line>` and are verified against the supplied issue text at that line.
 Pre-existing requirements cite `path:<line>` and their excerpts are verified
 against the recorded base revision before tests run. Each selected test node
@@ -379,11 +510,23 @@ case count, artifact sizes, and output-capture limit fit the current safety and
 execution contract; incompatible v1 bundles fail preflight with an explicit
 error instead of running under silently different limits.
 
-The current artifact versions are independent: release `0.5.0` writes manifest
-schema v2 plus context, evidence-plan, requirement-draft, requirement-review,
-reviewed-requirements, and test-proposals schema v1 artifacts. Consumers should
-use each artifact's own `schema_version`, not the package version, for
-compatibility decisions. The packaged contracts are
+When a run starts from `verify-materialized`, bundle schema v2 retains the
+effective EvidencePlan, candidate files, and issue used for execution, but it
+does not embed `materialization.json` or the reviewed-test-proposals audit.
+Keep the inert staging directory beside the evidence bundle when the review
+history must remain available. Reproduction authenticates and reruns the
+execution bundle; it does not reconstruct reviewer identity or approval.
+
+Artifact versions are independent. Release `0.6.0` writes manifest v2,
+context v1, requirement-draft v1, requirement-review v1,
+reviewed-requirements v2, test-proposals v2, test-proposal-review v1,
+reviewed-test-proposals v1, and test-materialization v1. Reviewed
+materialization writes EvidencePlan v2; direct verification and replay also
+accept strict legacy EvidencePlan v1. The reviewed-requirements and
+test-proposals loaders accept strict legacy v1 documents, but a v1 chain lacks
+the exact issue binding required for new test review and materialization.
+Consumers should use each artifact's own `schema_version`, not the package
+version, for compatibility decisions. The packaged contracts are
 [`manifest.schema.json`](src/patch_verifier/schemas/manifest.schema.json),
 [`context.schema.json`](src/patch_verifier/schemas/context.schema.json), and
 [`evidence-plan.schema.json`](src/patch_verifier/schemas/evidence-plan.schema.json),
@@ -393,7 +536,11 @@ plus
 and
 [`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json),
 plus
-[`test-proposals.schema.json`](src/patch_verifier/schemas/test-proposals.schema.json).
+[`test-proposals.schema.json`](src/patch_verifier/schemas/test-proposals.schema.json),
+[`test-proposal-review.schema.json`](src/patch_verifier/schemas/test-proposal-review.schema.json),
+[`reviewed-test-proposals.schema.json`](src/patch_verifier/schemas/reviewed-test-proposals.schema.json),
+and
+[`test-materialization.schema.json`](src/patch_verifier/schemas/test-materialization.schema.json).
 
 ## Scope and safety
 
@@ -449,6 +596,24 @@ These checks bound parsing and preserve exact provenance, but static parsing
 does not establish that an assertion correctly expresses its linked
 requirement. Generated source remains untrusted and `requires_review` even
 after a successful import.
+
+Proposal review and materialization preserve exact bytes and fail on drift,
+unsafe path aliases, collisions, incomplete decisions, or an incomplete
+staging inventory. Their SHA-256 bindings provide integrity relative to the
+artifacts being checked; they are not signatures and do not identify or
+authenticate a reviewer. An `accept` or `edit` decision records human intent,
+not proof that the test is correct, complete, safe, or faithful to its linked
+requirement. Materialized candidates remain inert until the user explicitly
+runs `verify-materialized` (or separately passes their plan to `verify`).
+
+Static AST validation is not a safe substitute for execution isolation. Pytest
+collection imports candidate modules and can execute arbitrary module-level or
+plugin code. APV therefore does not collect candidates during proposal import,
+review, finalization, or materialization. The explicit verification handoff
+uses the current OS user and provides no filesystem, process, service, or
+network sandbox. Automatic collection preflight, model invocation, and bounded
+model-assisted repair remain deferred until an appropriate isolation boundary
+exists.
 
 Evidence bundles can contain issue text, candidate code, source excerpts,
 commands, filesystem paths, and captured test output. Review them before

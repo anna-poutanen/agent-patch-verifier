@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-patch-verifier:test-materialization:1",
+  "title": "Agent Patch Verifier completed test materialization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "complete",
+    "reviewed_test_proposals",
+    "proposal_artifact",
+    "reviewed_requirements",
+    "review",
+    "issue",
+    "evidence_plan",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "artifact_type": {"const": "test-materialization"},
+    "complete": {"const": true},
+    "reviewed_test_proposals": {"$ref": "#/$defs/bound_file"},
+    "proposal_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "schema_version", "proposal_count"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"type": "integer", "enum": [1, 2]},
+        "proposal_count": {"type": "integer", "minimum": 1, "maximum": 50}
+      }
+    },
+    "reviewed_requirements": {"$ref": "#/$defs/hash_binding"},
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "schema_version"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"type": "integer", "const": 1}
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size"],
+      "properties": {
+        "path": {"const": "issue.md"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 2097152}
+      }
+    },
+    "evidence_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema_version", "sha256", "size"],
+      "properties": {
+        "path": {"const": "evidence-plan.json"},
+        "schema_version": {"type": "integer", "const": 2},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 5242880}
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "path", "sha256", "size"],
+        "properties": {
+          "case_id": {"type": "string", "pattern": "^case-[0-9a-f]{59}$"},
+          "path": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "\\.py$"},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "size": {"type": "integer", "minimum": 1, "maximum": 2097152}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hash_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {"sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "bound_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 128},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 67108864}
+      }
+    }
+  }
+}

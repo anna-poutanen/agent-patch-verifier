@@ -22,6 +22,8 @@ from types import MappingProxyType
 from typing import BinaryIO, Mapping, Sequence
 import xml.etree.ElementTree as ET
 
+from .safe_io import BoundedFileReadError, read_bounded_regular_file
+
 
 PYTHONHASHSEED = "0"
 _TIMEOUT_CLEANUP_SECONDS = 0.25
@@ -415,20 +417,23 @@ def _run_once(
             )
         )
         exit_code = process.returncode
+        # Candidate code controls the workspace. Freeze the JUnit report once
+        # through a non-blocking regular-file boundary, then derive both the
+        # classification and signature from that same parsed document. Apart
+        # from avoiding inconsistent double reads, this prevents a candidate
+        # from replacing the report with a FIFO after its subprocess exits and
+        # bypassing the execution timeout in a later verifier-side open.
+        junit_root = None if junit_path is None else _load_junit_root(junit_path)
         status = (
             classify_exit_code(exit_code)
             if junit_path is None
-            else classify_junit_result(
+            else _classify_junit_root(
                 exit_code,
-                junit_path,
+                junit_root,
                 expected_node=command.expected_node,
             )
         )
-        failure_signature = (
-            None
-            if junit_path is None
-            else junit_failure_signature(junit_path)
-        )
+        failure_signature = _junit_failure_signature(junit_root)
         return _result(
             target,
             attempt,
@@ -545,9 +550,24 @@ def classify_junit_result(
     treated as evidence that the candidate assertion failed.
     """
 
+    root = _load_junit_root(path)
+    return _classify_junit_root(
+        exit_code,
+        root,
+        expected_node=expected_node,
+    )
+
+
+def _classify_junit_root(
+    exit_code: int,
+    root: ET.Element | None,
+    *,
+    expected_node: str | None = None,
+) -> CommandStatus:
+    """Classify one already-frozen and parsed JUnit document."""
+
     if exit_code not in {0, 1}:
         return CommandStatus.ERROR
-    root = _load_junit_root(path)
     if root is None:
         return CommandStatus.ERROR
     suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
@@ -584,6 +604,12 @@ def junit_failure_signature(path: Path) -> str | None:
     """Return a path-independent digest for the observed JUnit failure."""
 
     root = _load_junit_root(path)
+    return _junit_failure_signature(root)
+
+
+def _junit_failure_signature(root: ET.Element | None) -> str | None:
+    """Digest failure evidence from one already-parsed JUnit document."""
+
     if root is None:
         return None
     elements = [
@@ -613,16 +639,29 @@ def junit_failure_signature(path: Path) -> str | None:
 
 
 def _load_junit_root(path: Path) -> ET.Element | None:
-    try:
-        with path.open("rb") as stream:
-            payload = stream.read(OUTPUT_LIMIT_BYTES + 1)
-    except OSError:
-        return None
-    if len(payload) > OUTPUT_LIMIT_BYTES:
+    payload = _read_junit_bytes(path)
+    if payload is None:
         return None
     try:
         return ET.fromstring(payload)
     except ET.ParseError:
+        return None
+
+
+def _read_junit_bytes(path: Path) -> bytes | None:
+    """Freeze a bounded JUnit report without following links or FIFOs.
+
+    Descriptor-relative opens use ``O_NONBLOCK`` so a replacement with a FIFO
+    cannot outlive the subprocess timeout. Platforms without the required
+    descriptor-relative, no-follow, and non-blocking primitives fail closed.
+    """
+
+    try:
+        return read_bounded_regular_file(
+            Path(path),
+            max_bytes=OUTPUT_LIMIT_BYTES,
+        )
+    except BoundedFileReadError:
         return None
 
 

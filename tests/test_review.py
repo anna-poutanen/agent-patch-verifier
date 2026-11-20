@@ -182,6 +182,11 @@ def test_finalization_emits_plan_shaped_requirements_and_complete_audit(
     finalized = finalize_requirement_review(draft_document, review_document)
 
     validate_reviewed_requirements_artifact(finalized)
+    assert finalized["schema_version"] == 2
+    assert finalized["issue"] == {
+        "sha256": hashlib.sha256(issue_text.encode("utf-8")).hexdigest(),
+        "source": json.loads(draft_document)["inputs"]["issue_source"],
+    }
     assert finalized["draft"] == ledger["draft"]
     assert finalized["review"]["sha256"] == hashlib.sha256(
         review_document
@@ -203,6 +208,22 @@ def test_finalization_emits_plan_shaped_requirements_and_complete_audit(
     assert preservation["source"].startswith("tests/test_value.py:")
     assert preservation["provenance"] == "preexisting"
     assert "\n" in preservation["statement"]
+
+    legacy = copy.deepcopy(finalized)
+    legacy["schema_version"] = 1
+    legacy.pop("issue")
+    validate_reviewed_requirements_artifact(legacy)
+    legacy["issue"] = copy.deepcopy(finalized["issue"])
+    with pytest.raises(ValueError):
+        validate_reviewed_requirements_artifact(legacy)
+    missing_v2_binding = copy.deepcopy(finalized)
+    missing_v2_binding.pop("issue")
+    with pytest.raises(ValueError):
+        validate_reviewed_requirements_artifact(missing_v2_binding)
+    floating_version = copy.deepcopy(finalized)
+    floating_version["schema_version"] = 2.0
+    with pytest.raises(ValueError, match="schema_version: expected integer"):
+        validate_reviewed_requirements_artifact(floating_version)
 
     candidate_tests = tmp_path / "candidate.py"
     candidate_tests.write_text(

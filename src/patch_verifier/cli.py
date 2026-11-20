@@ -45,6 +45,24 @@ class _TestProposalWriteResult(Protocol):
     unproposed_requirement_count: int
 
 
+class _TestReviewPreparationResult(Protocol):
+    output_file: Path
+    proposal_count: int
+
+
+class _TestReviewFinalizationResult(Protocol):
+    output_file: Path
+    accepted_case_count: int
+    rejected_count: int
+
+
+class _TestMaterializationResult(Protocol):
+    output_directory: Path
+    evidence_plan_file: Path
+    manifest_file: Path
+    case_count: int
+
+
 def _draft_patch_requirements(
     *,
     repository: Path,
@@ -227,6 +245,124 @@ def _import_test_proposals(
         raise ValueError(str(exc)) from exc
 
 
+def _prepare_test_review(
+    *,
+    proposal_file: Path,
+    reviewed_file: Path,
+    issue_file: Path,
+    response_file: Path | None,
+    output_file: Path,
+) -> _TestReviewPreparationResult:
+    """Create an inert, all-pending ledger from exact proposal inputs."""
+
+    from .test_review import (
+        TestProposalReviewError,
+        write_test_proposal_review,
+    )
+
+    try:
+        return write_test_proposal_review(
+            proposal_file,
+            reviewed_file,
+            issue_file,
+            output_file,
+            generator_response_file=response_file,
+        )
+    except TestProposalReviewError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _finalize_test_review(
+    *,
+    proposal_file: Path,
+    reviewed_file: Path,
+    issue_file: Path,
+    review_file: Path,
+    response_file: Path | None,
+    output_file: Path,
+) -> _TestReviewFinalizationResult:
+    """Finalize explicit test-proposal decisions without executing code."""
+
+    from .test_review import (
+        TestProposalReviewError,
+        write_reviewed_test_proposals,
+    )
+
+    try:
+        return write_reviewed_test_proposals(
+            proposal_file,
+            reviewed_file,
+            review_file,
+            issue_file,
+            output_file,
+            generator_response_file=response_file,
+        )
+    except TestProposalReviewError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _materialize_reviewed_tests(
+    *,
+    reviewed_tests_file: Path,
+    proposal_file: Path,
+    reviewed_file: Path,
+    issue_file: Path,
+    review_file: Path,
+    response_file: Path | None,
+    output_directory: Path,
+) -> _TestMaterializationResult:
+    """Write reviewed candidate bytes and a plan without loading their code."""
+
+    from .test_review import (
+        TestProposalReviewError,
+        materialize_reviewed_test_proposal_files,
+    )
+
+    try:
+        return materialize_reviewed_test_proposal_files(
+            reviewed_tests_file,
+            proposal_file,
+            reviewed_file,
+            review_file,
+            issue_file,
+            output_directory,
+            generator_response_file=response_file,
+        )
+    except TestProposalReviewError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _request_from_test_materialization(
+    *,
+    materialization_directory: Path,
+    repository: Path,
+    base_revision: str,
+    patch_file: Path,
+    output_directory: Path | None,
+    command_prefix: tuple[str, ...],
+    timeout_seconds: float,
+    repeat: int,
+) -> VerificationRequest:
+    """Authenticate reviewed staging and build an exact-hash request."""
+
+    from .materialization import TestMaterializationError
+    from .verifier import request_from_materialization
+
+    try:
+        return request_from_materialization(
+            materialization_directory,
+            repository=repository,
+            base_revision=base_revision,
+            patch_file=patch_file,
+            output_directory=output_directory,
+            command_prefix=command_prefix,
+            timeout_seconds=timeout_seconds,
+            repeat=repeat,
+        )
+    except TestMaterializationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apv",
@@ -341,6 +477,126 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="new test-proposals path; existing files are never overwritten",
     )
+    prepare_test_review_parser = subparsers.add_parser(
+        "prepare-test-review",
+        help="create an inert, all-pending review ledger for test proposals",
+    )
+    prepare_test_review_parser.add_argument(
+        "--proposals",
+        type=Path,
+        required=True,
+        help="exact test-proposals JSON artifact",
+    )
+    prepare_test_review_parser.add_argument(
+        "--reviewed",
+        type=Path,
+        required=True,
+        help="exact reviewed-requirements JSON artifact",
+    )
+    prepare_test_review_parser.add_argument(
+        "--issue",
+        type=Path,
+        required=True,
+        help="exact UTF-8 issue description bound by reviewed requirements",
+    )
+    prepare_test_review_parser.add_argument(
+        "--response",
+        type=Path,
+        help="exact generator response when the proposal artifact binds one",
+    )
+    prepare_test_review_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="new pending-review path; existing files are never overwritten",
+    )
+    finalize_test_review_parser = subparsers.add_parser(
+        "finalize-test-review",
+        help="finalize explicit proposal decisions without executing tests",
+    )
+    finalize_test_review_parser.add_argument(
+        "--proposals",
+        type=Path,
+        required=True,
+        help="exact test-proposals JSON artifact",
+    )
+    finalize_test_review_parser.add_argument(
+        "--reviewed",
+        type=Path,
+        required=True,
+        help="exact reviewed-requirements JSON artifact",
+    )
+    finalize_test_review_parser.add_argument(
+        "--issue",
+        type=Path,
+        required=True,
+        help="exact UTF-8 issue description bound by reviewed requirements",
+    )
+    finalize_test_review_parser.add_argument(
+        "--review",
+        type=Path,
+        required=True,
+        help="completed test-proposal review ledger with no pending decisions",
+    )
+    finalize_test_review_parser.add_argument(
+        "--response",
+        type=Path,
+        help="exact generator response when the proposal artifact binds one",
+    )
+    finalize_test_review_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=(
+            "new reviewed-test-proposals path; existing files are never "
+            "overwritten"
+        ),
+    )
+    materialize_tests_parser = subparsers.add_parser(
+        "materialize-reviewed-tests",
+        help="stage reviewed test bytes and an EvidencePlan without execution",
+    )
+    materialize_tests_parser.add_argument(
+        "--reviewed-tests",
+        type=Path,
+        required=True,
+        help="exact reviewed-test-proposals JSON artifact",
+    )
+    materialize_tests_parser.add_argument(
+        "--proposals",
+        type=Path,
+        required=True,
+        help="exact test-proposals JSON artifact",
+    )
+    materialize_tests_parser.add_argument(
+        "--reviewed",
+        type=Path,
+        required=True,
+        help="exact reviewed-requirements JSON artifact",
+    )
+    materialize_tests_parser.add_argument(
+        "--issue",
+        type=Path,
+        required=True,
+        help="exact UTF-8 issue description bound by reviewed requirements",
+    )
+    materialize_tests_parser.add_argument(
+        "--review",
+        type=Path,
+        required=True,
+        help="exact completed test-proposal review ledger",
+    )
+    materialize_tests_parser.add_argument(
+        "--response",
+        type=Path,
+        help="exact generator response when the proposal artifact binds one",
+    )
+    materialize_tests_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="new staging directory; existing paths are never overwritten",
+    )
     verify_parser = subparsers.add_parser(
         "verify", help="verify a proposed textual Git patch"
     )
@@ -357,6 +613,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_parser.add_argument("--timeout", type=float, default=60.0)
     verify_parser.add_argument("--repeat", type=int, default=2)
+    verify_materialized_parser = subparsers.add_parser(
+        "verify-materialized",
+        help="authenticate reviewed staging, then explicitly execute its tests",
+    )
+    verify_materialized_parser.add_argument(
+        "--materialization",
+        type=Path,
+        required=True,
+        help="completed reviewed-test staging directory",
+    )
+    verify_materialized_parser.add_argument(
+        "--repo", type=Path, default=Path.cwd()
+    )
+    verify_materialized_parser.add_argument("--base", default="HEAD")
+    verify_materialized_parser.add_argument(
+        "--patch", type=Path, required=True
+    )
+    verify_materialized_parser.add_argument("--output", type=Path)
+    verify_materialized_parser.add_argument(
+        "--test-command",
+        default=f"{shlex.quote(sys.executable)} -m pytest -q --tb=short",
+        help="shell-like command prefix parsed into arguments; no shell is executed",
+    )
+    verify_materialized_parser.add_argument(
+        "--timeout", type=float, default=60.0
+    )
+    verify_materialized_parser.add_argument("--repeat", type=int, default=2)
     reproduce_parser = subparsers.add_parser(
         "reproduce", help="rerun a saved evidence bundle"
     )
@@ -461,6 +744,63 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "collected, or executed."
             )
             return
+        if arguments.command == "prepare-test-review":
+            test_review_result = _prepare_test_review(
+                proposal_file=arguments.proposals,
+                reviewed_file=arguments.reviewed,
+                issue_file=arguments.issue,
+                response_file=arguments.response,
+                output_file=arguments.output,
+            )
+            print(f"Test proposal review: {test_review_result.output_file}")
+            print(
+                f"Proposals: {test_review_result.proposal_count} "
+                "(all pending; explicit human review required)"
+            )
+            print(
+                "Candidate source was parsed as inert text only; it was not "
+                "imported, collected, or executed."
+            )
+            return
+        if arguments.command == "finalize-test-review":
+            finalized_tests_result = _finalize_test_review(
+                proposal_file=arguments.proposals,
+                reviewed_file=arguments.reviewed,
+                issue_file=arguments.issue,
+                review_file=arguments.review,
+                response_file=arguments.response,
+                output_file=arguments.output,
+            )
+            print(
+                "Reviewed test proposals: "
+                f"{finalized_tests_result.output_file}"
+            )
+            print(f"Accepted: {finalized_tests_result.accepted_case_count}")
+            print(f"Rejected: {finalized_tests_result.rejected_count}")
+            print(
+                "Candidate source was parsed as inert text only; it was not "
+                "imported, collected, or executed."
+            )
+            return
+        if arguments.command == "materialize-reviewed-tests":
+            materialization_result = _materialize_reviewed_tests(
+                reviewed_tests_file=arguments.reviewed_tests,
+                proposal_file=arguments.proposals,
+                reviewed_file=arguments.reviewed,
+                issue_file=arguments.issue,
+                review_file=arguments.review,
+                response_file=arguments.response,
+                output_directory=arguments.output_dir,
+            )
+            print(f"Staging directory: {materialization_result.output_directory}")
+            print(f"Evidence plan: {materialization_result.evidence_plan_file}")
+            print(f"Completion manifest: {materialization_result.manifest_file}")
+            print(f"Accepted cases staged: {materialization_result.case_count}")
+            print(
+                "Candidate files were written but were not imported, "
+                "collected, or executed."
+            )
+            return
         if arguments.command == "verify":
             command_prefix = tuple(shlex.split(arguments.test_command))
             repository = arguments.repo.resolve()
@@ -475,6 +815,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 command_prefix=command_prefix,
                 timeout_seconds=arguments.timeout,
                 repeat=arguments.repeat,
+            )
+        elif arguments.command == "verify-materialized":
+            repository = arguments.repo.resolve()
+            request = _request_from_test_materialization(
+                materialization_directory=arguments.materialization,
+                repository=repository,
+                base_revision=arguments.base,
+                patch_file=arguments.patch,
+                output_directory=arguments.output,
+                command_prefix=tuple(shlex.split(arguments.test_command)),
+                timeout_seconds=arguments.timeout,
+                repeat=arguments.repeat,
+            )
+            print(
+                "Warning: reviewed candidate tests are still untrusted Python; "
+                "they will now run with the invoking user's permissions and "
+                "without an OS sandbox.",
+                file=sys.stderr,
             )
         else:
             command_override = (

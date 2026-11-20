@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
+import unicodedata
 
 from . import __version__
 from .change_analysis import ChangedSymbol, FileChange, analyze_changed_symbols, parse_unified_diff
@@ -31,7 +32,13 @@ from .models import (
     RevisionResult as EvidenceRevisionResult,
 )
 from .patches import is_binary_patch
-from .plan import CandidateCase, EvidencePlan, load_evidence_plan, verify_base_sources
+from .plan import (
+    CandidateCase,
+    EvidencePlan,
+    PlanError,
+    load_evidence_plan,
+    verify_base_sources,
+)
 from .runner import (
     CommandResult,
     DualRunResult,
@@ -41,6 +48,7 @@ from .runner import (
     TestCommand,
     run_dual,
 )
+from .safe_io import BoundedFileReadError, read_bounded_regular_file
 from .workspace import PatchWorkspace, WorkspaceSnapshot
 
 
@@ -153,6 +161,12 @@ class VerificationRequest:
     expected_evidence_sha256: str | None = None
     expected_scope_sha256: str | None = None
     expected_test_sha256: tuple[tuple[str, str], ...] = ()
+    frozen_patch_document: bytes | None = field(default=None, repr=False)
+    frozen_issue_document: bytes | None = field(default=None, repr=False)
+    frozen_evidence_document: bytes | None = field(default=None, repr=False)
+    frozen_candidate_documents: tuple[tuple[str, bytes], ...] = field(
+        default=(), repr=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_revision, str):
@@ -168,9 +182,15 @@ class VerificationRequest:
         if isinstance(self.repeat, bool) or not isinstance(self.repeat, int):
             raise TypeError("repeat must be an integer")
         object.__setattr__(self, "repository", Path(self.repository).resolve())
-        object.__setattr__(self, "patch_file", Path(self.patch_file).resolve())
-        object.__setattr__(self, "issue_file", Path(self.issue_file).resolve())
-        object.__setattr__(self, "evidence_file", Path(self.evidence_file).resolve())
+        object.__setattr__(
+            self, "patch_file", Path(os.path.abspath(self.patch_file))
+        )
+        object.__setattr__(
+            self, "issue_file", Path(os.path.abspath(self.issue_file))
+        )
+        object.__setattr__(
+            self, "evidence_file", Path(os.path.abspath(self.evidence_file))
+        )
         object.__setattr__(
             self, "output_directory", Path(self.output_directory).resolve()
         )
@@ -209,6 +229,68 @@ class VerificationRequest:
             "expected_test_sha256",
             tuple(sorted(normalized_test_hashes)),
         )
+        for label, document in (
+            ("frozen patch", self.frozen_patch_document),
+            ("frozen issue", self.frozen_issue_document),
+            ("frozen evidence plan", self.frozen_evidence_document),
+        ):
+            if document is not None and not isinstance(document, bytes):
+                raise TypeError(f"{label} document must be exact bytes")
+        raw_frozen_candidates = self.frozen_candidate_documents
+        if isinstance(raw_frozen_candidates, Mapping):
+            frozen_candidate_items = tuple(raw_frozen_candidates.items())
+        else:
+            frozen_candidate_items = tuple(raw_frozen_candidates)
+        normalized_frozen_candidates: list[tuple[str, bytes]] = []
+        seen_frozen_paths: set[str] = set()
+        for item in frozen_candidate_items:
+            if (
+                not isinstance(item, (tuple, list))
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not item[0]
+                or not isinstance(item[1], bytes)
+            ):
+                raise TypeError(
+                    "frozen_candidate_documents must contain "
+                    "(relative path, exact bytes) pairs"
+                )
+            relative_path, document = item
+            if relative_path in seen_frozen_paths:
+                raise ValueError(
+                    f"duplicate frozen candidate path: {relative_path!r}"
+                )
+            seen_frozen_paths.add(relative_path)
+            normalized_frozen_candidates.append((relative_path, document))
+        object.__setattr__(
+            self,
+            "frozen_candidate_documents",
+            tuple(sorted(normalized_frozen_candidates)),
+        )
+        frozen_snapshot = (
+            self.frozen_issue_document is not None,
+            self.frozen_evidence_document is not None,
+            bool(normalized_frozen_candidates),
+        )
+        if any(frozen_snapshot) and not all(frozen_snapshot):
+            raise ValueError(
+                "frozen materialization inputs require issue, evidence plan, "
+                "and candidate documents together"
+            )
+        if all(frozen_snapshot) and (
+            self.expected_issue_sha256 is None
+            or self.expected_evidence_sha256 is None
+            or not normalized_test_hashes
+        ):
+            raise ValueError(
+                "frozen materialization inputs require expected issue, evidence, "
+                "and candidate hashes"
+            )
+        if (
+            self.frozen_patch_document is not None
+            and self.expected_patch_sha256 is None
+        ):
+            raise ValueError("a frozen patch requires an expected patch hash")
         if not self.base_revision.strip():
             raise ValueError("base_revision must not be empty")
         if not self.command_prefix:
@@ -238,6 +320,24 @@ class VerificationRequest:
     @property
     def expected_test_hashes(self) -> dict[str, str]:
         return dict(self.expected_test_sha256)
+
+    @property
+    def frozen_candidate_sources(self) -> dict[str, bytes] | None:
+        if not self.frozen_candidate_documents:
+            return None
+        return dict(self.frozen_candidate_documents)
+
+
+@dataclass(frozen=True)
+class _BundleInputSnapshot:
+    """Exact authenticated bundle bytes retained across replay handoff."""
+
+    patch_document: bytes = field(repr=False)
+    issue_document: bytes = field(repr=False)
+    evidence_document: bytes = field(repr=False)
+    candidate_documents: tuple[tuple[str, bytes], ...] = field(repr=False)
+    results_document: bytes = field(repr=False)
+    context_document: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -284,11 +384,12 @@ class VerificationResult:
 def verify(request: VerificationRequest) -> VerificationResult:
     """Execute a complete verification run and write its evidence bundle."""
 
-    patch_bytes = _read_bytes(
+    patch_bytes = _read_or_use_frozen_bytes(
         request.patch_file,
         "patch",
         max_bytes=_MAX_PATCH_BYTES,
         expected_sha256=request.expected_patch_sha256,
+        frozen_document=request.frozen_patch_document,
     )
     if is_binary_patch(patch_bytes):
         raise VerificationError("binary patches are outside the current MVP scope")
@@ -296,27 +397,33 @@ def verify(request: VerificationRequest) -> VerificationResult:
         patch_text = patch_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise VerificationError("patch must be UTF-8 text") from exc
-    issue_bytes = _read_bytes(
+    issue_bytes = _read_or_use_frozen_bytes(
         request.issue_file,
         "issue",
         max_bytes=_MAX_ISSUE_BYTES,
         expected_sha256=request.expected_issue_sha256,
+        frozen_document=request.frozen_issue_document,
     )
     try:
         issue_text = issue_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise VerificationError("issue file must be UTF-8") from exc
-    evidence_bytes = _read_bytes(
+    evidence_bytes = _read_or_use_frozen_bytes(
         request.evidence_file,
         "evidence plan",
         max_bytes=_MAX_EVIDENCE_PLAN_BYTES,
         expected_sha256=request.expected_evidence_sha256,
+        frozen_document=request.frozen_evidence_document,
     )
-    plan = load_evidence_plan(
-        request.evidence_file,
-        issue_text=issue_text,
-        document_bytes=evidence_bytes,
-    )
+    try:
+        plan = load_evidence_plan(
+            request.evidence_file,
+            issue_text=issue_text,
+            document_bytes=evidence_bytes,
+            candidate_source_documents=request.frozen_candidate_sources,
+        )
+    except PlanError as exc:
+        raise VerificationError(f"invalid evidence plan: {exc}") from exc
     _verify_expected_test_hashes(plan, request.expected_test_hashes)
     case_repetitions = len(plan.cases) * request.repeat
     if case_repetitions > _MAX_CASE_REPETITIONS:
@@ -331,6 +438,7 @@ def verify(request: VerificationRequest) -> VerificationResult:
         )
 
     run_id = _run_id(patch_bytes)
+    _require_unique_generated_test_paths(run_id, plan.cases)
     changes = parse_unified_diff(patch_text)
     case_results: list[CaseVerification] = []
     frozen_tests = {case.id: case.source_bytes for case in plan.cases}
@@ -613,6 +721,66 @@ def default_reproduction_output(run_directory: Path) -> Path:
     return run_directory.parent / f"{run_directory.name}-reproduction-{timestamp}"
 
 
+def request_from_materialization(
+    materialization_directory: Path,
+    *,
+    repository: Path,
+    base_revision: str,
+    patch_file: Path,
+    output_directory: Path | None = None,
+    command_prefix: tuple[str, ...] = (
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "--tb=short",
+    ),
+    timeout_seconds: float = 60.0,
+    repeat: int = 2,
+) -> VerificationRequest:
+    """Build an exact-hash request from a completed reviewed-test staging root.
+
+    The materialization manifest authenticates internal consistency relative to
+    the supplied directory; it is not a signature. The patch remains an
+    explicit verification input because the current review chain does not bind
+    its bytes into the materialization manifest.
+    """
+
+    from .materialization import authenticate_test_materialization
+
+    authenticated = authenticate_test_materialization(
+        materialization_directory
+    )
+    repository_path = Path(repository).resolve()
+    return VerificationRequest(
+        repository=repository_path,
+        base_revision=base_revision,
+        patch_file=patch_file,
+        issue_file=authenticated.issue_file,
+        evidence_file=authenticated.evidence_plan_file,
+        output_directory=(
+            output_directory
+            if output_directory is not None
+            else default_output_directory(repository_path)
+        ),
+        command_prefix=command_prefix,
+        timeout_seconds=timeout_seconds,
+        repeat=repeat,
+        expected_issue_sha256=authenticated.issue_sha256,
+        expected_evidence_sha256=authenticated.evidence_plan_sha256,
+        expected_test_sha256=authenticated.expected_test_sha256,
+        frozen_issue_document=authenticated.issue_document,
+        frozen_evidence_document=authenticated.evidence_plan_document,
+        frozen_candidate_documents=tuple(
+            (
+                item.relative_path.as_posix(),
+                item.source_bytes,
+            )
+            for item in authenticated.files
+        ),
+    )
+
+
 def request_from_bundle(
     run_directory: Path,
     *,
@@ -656,7 +824,7 @@ def request_from_bundle(
         raise VerificationError(f"cannot read bundle manifest {manifest_path}: {exc}") from exc
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise VerificationError(f"invalid bundle manifest {manifest_path}: {exc}") from exc
-    _validate_bundle_inputs(run_directory, manifest)
+    snapshot = _validate_bundle_inputs(run_directory, manifest)
     expected_test_sha256 = tuple(
         (str(item["id"]), str(item["test_sha256"]))
         for item in manifest["cases"]
@@ -687,6 +855,10 @@ def request_from_bundle(
             else None
         ),
         expected_test_sha256=expected_test_sha256,
+        frozen_patch_document=snapshot.patch_document,
+        frozen_issue_document=snapshot.issue_document,
+        frozen_evidence_document=snapshot.evidence_document,
+        frozen_candidate_documents=snapshot.candidate_documents,
     )
 
 
@@ -699,7 +871,6 @@ def reproduction_differences(
     results_path = run_root / "results.json"
     manifest_path = run_root / "manifest.json"
     replay_root = result.output_directory.resolve()
-    replay_results_path = replay_root / "results.json"
     try:
         manifest_bytes = _read_bundle_bytes(
             manifest_path,
@@ -707,44 +878,23 @@ def reproduction_differences(
             "manifest",
             max_bytes=_MAX_MANIFEST_BYTES,
         )
-        results_bytes = _read_bundle_bytes(
-            results_path,
-            run_root,
-            "recorded results",
-            max_bytes=_MAX_RESULTS_BYTES,
-        )
         if (
             result.reproduction_manifest_sha256 is not None
             and hashlib.sha256(manifest_bytes).hexdigest()
             != result.reproduction_manifest_sha256
         ):
             raise VerificationError("recorded manifest changed during reproduction")
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        manifest = _validate_manifest_payload(manifest)
+        recorded_snapshot = _validate_bundle_inputs(run_root, manifest)
+        results_bytes = recorded_snapshot.results_document
         if (
             result.reproduction_results_sha256 is not None
             and hashlib.sha256(results_bytes).hexdigest()
             != result.reproduction_results_sha256
         ):
             raise VerificationError("recorded results changed during reproduction")
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-        manifest = _validate_manifest_payload(manifest)
-        _validate_bundle_inputs(run_root, manifest)
         payload = json.loads(results_bytes.decode("utf-8"))
-        replay_results_bytes = _read_bundle_bytes(
-            replay_results_path,
-            replay_root,
-            "reproduced results",
-            max_bytes=_MAX_RESULTS_BYTES,
-        )
-        observed_replay_results_sha256 = hashlib.sha256(
-            replay_results_bytes
-        ).hexdigest()
-        if observed_replay_results_sha256 != result.results_sha256:
-            raise VerificationError(
-                "reproduced results changed after verification: "
-                f"expected {result.results_sha256}, "
-                f"observed {observed_replay_results_sha256}"
-            )
-        replay_payload = json.loads(replay_results_bytes.decode("utf-8"))
         replay_manifest_bytes = _read_bundle_bytes(
             replay_root / "manifest.json",
             replay_root,
@@ -754,18 +904,40 @@ def reproduction_differences(
         replay_manifest = _validate_manifest_payload(
             json.loads(replay_manifest_bytes.decode("utf-8"))
         )
-        _validate_bundle_inputs(replay_root, replay_manifest)
+        replay_results_before_validation = _read_bundle_bytes(
+            replay_root / "results.json",
+            replay_root,
+            "reproduced results",
+            max_bytes=_MAX_RESULTS_BYTES,
+        )
+        observed_replay_results_sha256 = hashlib.sha256(
+            replay_results_before_validation
+        ).hexdigest()
+        if observed_replay_results_sha256 != result.results_sha256:
+            raise VerificationError(
+                "reproduced results changed after verification: "
+                f"expected {result.results_sha256}, "
+                f"observed {observed_replay_results_sha256}"
+            )
+        replay_snapshot = _validate_bundle_inputs(replay_root, replay_manifest)
+        replay_results_bytes = replay_snapshot.results_document
+        if replay_results_bytes != replay_results_before_validation:
+            raise VerificationError(
+                "reproduced results changed while validating the replay bundle"
+            )
+        replay_payload = json.loads(replay_results_bytes.decode("utf-8"))
         recorded = _case_execution_signatures(payload)
         replayed = _case_execution_signatures(replay_payload)
         schema_version = _bundle_schema_version(manifest)
         if schema_version == 2:
-            _, recorded_context = _load_context_artifact(
-                run_root / "context.json", run_root, "repository context"
+            assert recorded_snapshot.context_document is not None
+            assert replay_snapshot.context_document is not None
+            recorded_context = _validate_context_payload(
+                json.loads(recorded_snapshot.context_document.decode("utf-8"))
             )
-            replay_context_bytes, replay_context = _load_context_artifact(
-                replay_root / "context.json",
-                replay_root,
-                "reproduced repository context",
+            replay_context_bytes = replay_snapshot.context_document
+            replay_context = _validate_context_payload(
+                json.loads(replay_context_bytes.decode("utf-8"))
             )
             if (
                 hashlib.sha256(replay_context_bytes).hexdigest()
@@ -862,7 +1034,7 @@ def _raw_revision_signature(value: Mapping[str, Any]) -> tuple[Any, ...]:
 
 def _validate_bundle_inputs(
     run_directory: Path, manifest: Mapping[str, Any]
-) -> None:
+) -> _BundleInputSnapshot:
     manifest = _validate_manifest_payload(manifest)
     schema_version = _bundle_schema_version(manifest)
     artifacts = [
@@ -882,6 +1054,7 @@ def _validate_bundle_inputs(
             _MAX_HARNESS_BYTES,
         ),
     ]
+    context_document: bytes | None = None
     if schema_version == 2:
         artifacts.append(
             ("report.md", "report_sha256", "report", _MAX_REPORT_BYTES)
@@ -909,7 +1082,7 @@ def _validate_bundle_inputs(
             r"[0-9a-f]{64}", expected_context
         ):
             raise VerificationError("bundle manifest has no valid context_sha256")
-        _, context_payload = _load_context_artifact(
+        context_document, context_payload = _load_context_artifact(
             run_directory / "context.json",
             run_directory,
             "repository context",
@@ -955,6 +1128,7 @@ def _validate_bundle_inputs(
             raise ValueError("duplicate case ids in bundle manifest")
         if set(manifest_case_ids) != set(plan_by_id):
             raise ValueError("manifest and evidence-plan case ids differ")
+        candidate_documents: list[tuple[str, bytes]] = []
         for recorded in manifest_cases:
             case_id = str(recorded["id"])
             planned = plan_by_id[case_id]
@@ -988,13 +1162,14 @@ def _validate_bundle_inputs(
             test_hash = recorded.get("test_sha256")
             if not isinstance(test_hash, str):
                 raise ValueError(f"missing test hash for case {case_id}")
-            _require_hash(
+            candidate_document = _require_hash(
                 test_path,
                 test_hash,
                 f"test for case {case_id}",
                 run_directory,
                 max_bytes=_MAX_CANDIDATE_TEST_BYTES,
             )
+            candidate_documents.append((relative.as_posix(), candidate_document))
         results_payload = json.loads(
             artifact_bytes["results.json"].decode("utf-8")
         )
@@ -1013,6 +1188,15 @@ def _validate_bundle_inputs(
         ValueError,
     ) as exc:
         raise VerificationError(f"invalid bundle artifact mapping: {exc}") from exc
+
+    return _BundleInputSnapshot(
+        patch_document=artifact_bytes["patch.diff"],
+        issue_document=artifact_bytes["issue.md"],
+        evidence_document=artifact_bytes["evidence-plan.json"],
+        candidate_documents=tuple(sorted(candidate_documents)),
+        results_document=artifact_bytes["results.json"],
+        context_document=context_document,
+    )
 
 
 def _validate_results_payload(
@@ -1554,35 +1738,20 @@ def _read_bundle_bytes(
     *,
     max_bytes: int,
 ) -> bytes:
-    safe_path = _require_bundle_file(path, bundle_root, label)
     try:
-        with safe_path.open("rb") as stream:
-            raw = stream.read(max_bytes + 1)
-    except OSError as exc:
-        raise VerificationError(
-            f"cannot read bundled {label} {safe_path}: {exc}"
-        ) from exc
-    if len(raw) > max_bytes:
-        raise VerificationError(
-            f"bundled {label} exceeds the {max_bytes}-byte limit"
+        return read_bounded_regular_file(
+            path,
+            max_bytes=max_bytes,
+            root=bundle_root,
         )
-    return raw
-
-
-def _require_bundle_file(path: Path, bundle_root: Path, label: str) -> Path:
-    if path.is_symlink():
-        raise VerificationError(f"bundled {label} must not be a symbolic link")
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise VerificationError(f"cannot resolve bundled {label} {path}: {exc}") from exc
-    try:
-        resolved.relative_to(bundle_root)
-    except ValueError as exc:
-        raise VerificationError(f"bundled {label} escapes the bundle directory") from exc
-    if not resolved.is_file():
-        raise VerificationError(f"bundled {label} is not a regular file: {path}")
-    return resolved
+    except BoundedFileReadError as exc:
+        if f"exceeds the {max_bytes}-byte limit" in str(exc):
+            raise VerificationError(
+                f"bundled {label} exceeds the {max_bytes}-byte limit"
+            ) from exc
+        raise VerificationError(
+            f"cannot read bundled {label} {path}: {exc}"
+        ) from exc
 
 
 def _read_bytes(
@@ -1593,10 +1762,56 @@ def _read_bytes(
     expected_sha256: str | None = None,
 ) -> bytes:
     try:
-        with path.open("rb") as stream:
-            data = stream.read(max_bytes + 1)
-    except OSError as exc:
+        data = read_bounded_regular_file(path, max_bytes=max_bytes)
+    except BoundedFileReadError as exc:
+        if f"exceeds the {max_bytes}-byte limit" in str(exc):
+            raise VerificationError(
+                f"{label} file exceeds the {max_bytes}-byte limit: {path}"
+            ) from exc
         raise VerificationError(f"cannot read {label} file {path}: {exc}") from exc
+    return _validate_input_bytes(
+        data,
+        label,
+        path=path,
+        max_bytes=max_bytes,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _read_or_use_frozen_bytes(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+    expected_sha256: str | None,
+    frozen_document: bytes | None,
+) -> bytes:
+    """Use an authenticated snapshot without reopening its staging path."""
+
+    if frozen_document is None:
+        return _read_bytes(
+            path,
+            label,
+            max_bytes=max_bytes,
+            expected_sha256=expected_sha256,
+        )
+    return _validate_input_bytes(
+        frozen_document,
+        label,
+        path=path,
+        max_bytes=max_bytes,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _validate_input_bytes(
+    data: bytes,
+    label: str,
+    *,
+    path: Path,
+    max_bytes: int,
+    expected_sha256: str | None,
+) -> bytes:
     if len(data) > max_bytes:
         raise VerificationError(
             f"{label} file exceeds the {max_bytes}-byte limit: {path}"
@@ -1653,6 +1868,27 @@ def _generated_test_relative_path(run_id: str, case_id: str) -> Path:
     return Path(f".patch_verifier_generated_{run_id}") / (
         f"test_{safe_id}_{digest}.py"
     )
+
+
+def _require_unique_generated_test_paths(
+    run_id: str,
+    cases: Sequence[CandidateCase],
+) -> None:
+    """Fail before execution if two case IDs map to one injected filename."""
+
+    seen: dict[str, str] = {}
+    for case in cases:
+        relative = _generated_test_relative_path(run_id, case.id)
+        portable_key = unicodedata.normalize(
+            "NFC", relative.as_posix()
+        ).casefold()
+        previous = seen.get(portable_key)
+        if previous is not None:
+            raise VerificationError(
+                f"generated test name collision for cases {previous!r} and "
+                f"{case.id!r}"
+            )
+        seen[portable_key] = case.id
 
 
 def _to_evidence_result(result: RunnerRevisionResult) -> EvidenceRevisionResult:
@@ -1779,32 +2015,61 @@ def _write_bundle(
         (temporary / "harness" / "conftest.py").write_bytes(
             _IMPORT_GUARD_SOURCE
         )
+        bundled_destinations: set[str] = set()
         for case in cases:
             destination = temporary / "tests" / Path(case.injected_path).name
+            portable_key = unicodedata.normalize(
+                "NFC", destination.name
+            ).casefold()
+            if portable_key in bundled_destinations:
+                raise VerificationError(
+                    "generated test destination collision while writing the "
+                    f"bundle: {destination.name}"
+                )
+            bundled_destinations.add(portable_key)
             destination.write_bytes(frozen_tests[case.case.id])
         (temporary / "report.md").write_bytes(report_bytes)
-        os.replace(temporary, output)
-    except Exception:
+
+        # Reserve the requested path without replacing an empty directory or
+        # following a dangling symlink created during execution. The manifest
+        # is linked last as the completion marker; a failed publication may
+        # leave a visible incomplete directory, but never a consumable bundle.
+        os.mkdir(output, mode=0o700)
+        for name in (
+            "tests",
+            "harness",
+            "results.json",
+            "context.json",
+            "evidence-plan.json",
+            "issue.md",
+            "patch.diff",
+            "report.md",
+        ):
+            os.replace(temporary / name, output / name)
+        os.link(temporary / "manifest.json", output / "manifest.json")
+    finally:
         shutil.rmtree(temporary, ignore_errors=True)
-        raise
 
 
 def _bundled_plan(
     plan: EvidencePlan, cases: Sequence[CaseVerification]
 ) -> dict[str, Any]:
+    bundled_cases: list[dict[str, Any]] = []
+    for item in cases:
+        bundled_case: dict[str, Any] = {
+            "id": item.case.id,
+            "requirement_id": item.case.requirement_id,
+            "test_file": f"tests/{Path(item.injected_path).name}",
+            "node": item.case.node,
+            "rationale": item.case.rationale,
+        }
+        if plan.schema_version == 2:
+            bundled_case["test_sha256"] = item.test_sha256
+        bundled_cases.append(bundled_case)
     return {
-        "schema_version": 1,
+        "schema_version": plan.schema_version,
         "requirements": [item.to_dict() for item in plan.requirements],
-        "cases": [
-            {
-                "id": item.case.id,
-                "requirement_id": item.case.requirement_id,
-                "test_file": f"tests/{Path(item.injected_path).name}",
-                "node": item.case.node,
-                "rationale": item.case.rationale,
-            }
-            for item in cases
-        ],
+        "cases": bundled_cases,
     }
 
 

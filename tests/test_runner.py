@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import patch_verifier.runner as runner_module
 from patch_verifier.runner import (
@@ -319,12 +320,18 @@ class RunnerTests(unittest.TestCase):
                 junit_xml_path=Path("result.xml"),
             )
 
-            result = run_revision(
-                RevisionWorkspace(Revision.BASE, workspace), command
-            )
+            with mock.patch.object(
+                runner_module,
+                "_load_junit_root",
+                wraps=runner_module._load_junit_root,
+            ) as load_junit_root:
+                result = run_revision(
+                    RevisionWorkspace(Revision.BASE, workspace), command
+                )
 
             self.assertEqual(result.status, CommandStatus.FAIL)
             self.assertIsNotNone(result.attempts[0].failure_signature)
+            self.assertEqual(load_junit_root.call_count, 1)
 
     def test_junit_test_code_exception_is_a_harness_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -425,6 +432,103 @@ class RunnerTests(unittest.TestCase):
                 classify_junit_result(1, oversized), CommandStatus.ERROR
             )
             self.assertIsNone(junit_failure_signature(oversized))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs require POSIX")
+    def test_junit_fifo_is_rejected_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fifo = Path(temporary_directory) / "result.xml"
+            os.mkfifo(fifo)
+
+            started = time.perf_counter()
+            status = classify_junit_result(1, fifo)
+            signature = junit_failure_signature(fifo)
+            elapsed = time.perf_counter() - started
+
+            self.assertEqual(status, CommandStatus.ERROR)
+            self.assertIsNone(signature)
+            self.assertLess(elapsed, 1.0)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs require POSIX")
+    def test_candidate_cannot_escape_timeout_with_junit_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            command = Command(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os; os.mkfifo('result.xml'); raise SystemExit(1)",
+                ),
+                junit_xml_path=Path("result.xml"),
+            )
+
+            started = time.perf_counter()
+            result = run_revision(
+                RevisionWorkspace(Revision.BASE, workspace),
+                command,
+                RunOptions(timeout_seconds=0.5),
+            )
+            elapsed = time.perf_counter() - started
+
+            self.assertEqual(result.status, CommandStatus.ERROR)
+            self.assertIsNone(result.attempts[0].failure_signature)
+            self.assertLess(elapsed, 1.0)
+
+    def test_junit_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "real.xml"
+            target.write_text(
+                '<testsuite tests="1" errors="0" failures="0" skipped="0">'
+                '<testcase name="test_value" />'
+                "</testsuite>",
+                encoding="utf-8",
+            )
+            link = root / "result.xml"
+            try:
+                link.symlink_to(target)
+            except OSError as exc:
+                self.skipTest(f"symbolic links unavailable: {exc}")
+
+            self.assertEqual(
+                classify_junit_result(0, link),
+                CommandStatus.ERROR,
+            )
+            self.assertIsNone(junit_failure_signature(link))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs require POSIX")
+    def test_junit_fifo_swap_between_inspection_and_open_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report = Path(temporary_directory) / "result.xml"
+            report.write_text(
+                '<testsuite tests="1" errors="0" failures="0" skipped="0">'
+                '<testcase name="test_value" />'
+                "</testsuite>",
+                encoding="utf-8",
+            )
+            original_open = os.open
+            replaced = False
+
+            def replace_with_fifo(
+                path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal replaced
+                if path == report.name and not replaced:
+                    replaced = True
+                    report.unlink()
+                    os.mkfifo(report)
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=replace_with_fifo):
+                started = time.perf_counter()
+                root = runner_module._load_junit_root(report)
+                elapsed = time.perf_counter() - started
+
+            self.assertIsNone(root)
+            self.assertTrue(replaced)
+            self.assertLess(elapsed, 1.0)
 
     def test_malformed_junit_counts_are_harness_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

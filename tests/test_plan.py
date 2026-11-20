@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import time
 
 import pytest
+from jsonschema import Draft202012Validator
 
 import patch_verifier.plan as plan_module
 from patch_verifier.plan import (
@@ -19,12 +22,18 @@ from patch_verifier.plan import (
 ISSUE = "Explicit zero must return zero. Existing non-missing values remain unchanged."
 
 
-def write_plan(tmp_path: Path, requirements: list[dict], cases: list[dict]) -> Path:
+def write_plan(
+    tmp_path: Path,
+    requirements: list[dict],
+    cases: list[dict],
+    *,
+    schema_version: int = 1,
+) -> Path:
     path = tmp_path / "evidence.json"
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "requirements": requirements,
                 "cases": cases,
             }
@@ -156,6 +165,58 @@ def test_inline_validator_does_not_split_newline_heavy_bounded_source() -> None:
 
     assert len(source) == plan_module._MAX_CANDIDATE_FILE_BYTES
     assert result.assertion_excerpt == "assert True"
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [b"# coding: latin-1\n", b"#!/usr/bin/python\n# coding: cp1252\n"],
+)
+def test_inline_validator_rejects_non_utf8_python_encoding_cookie(
+    cookie: bytes,
+) -> None:
+    source = cookie + (
+        b"def test_value():\n"
+        b"    label = 'caf\xc3\xa9'\n"
+        b"    assert label == 'caf\xc3\xa9'\n"
+    )
+
+    with pytest.raises(PlanError, match="must declare UTF-8"):
+        validate_candidate_test_source(
+            source,
+            case_id="CASE-ENCODING",
+            node="test_value",
+        )
+
+
+def test_inline_validator_accepts_utf8_python_encoding_alias() -> None:
+    source = (
+        b"# coding: utf_8\n"
+        b"def test_value():\n"
+        b"    label = 'caf\xc3\xa9'\n"
+        b"    assert label == 'caf\xc3\xa9'\n"
+    )
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-ENCODING",
+        node="test_value",
+    )
+
+    assert result.assertion_excerpt == "assert label == 'caf\xe9'"
+
+
+def test_inline_validator_rejects_utf8_byte_order_mark() -> None:
+    source = (
+        b"\xef\xbb\xbfdef test_value():\n"
+        b"    assert True\n"
+    )
+
+    with pytest.raises(PlanError, match="must declare UTF-8"):
+        validate_candidate_test_source(
+            source,
+            case_id="CASE-BOM",
+            node="test_value",
+        )
 
 
 def test_inline_validator_ignores_assertions_in_nested_scopes() -> None:
@@ -322,6 +383,249 @@ def test_loads_requirement_linked_case(tmp_path: Path) -> None:
     assert len(plan.cases[0].source_sha256) == 64
 
 
+def test_evidence_plan_v2_binds_exact_candidate_bytes(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.py"
+    source = b"def test_zero():\n    assert True\n"
+    candidate.write_bytes(source)
+    digest = hashlib.sha256(source).hexdigest()
+    case = {
+        "id": "CASE-1",
+        "requirement_id": "REQ-1",
+        "test_file": "candidate.py",
+        "node": "test_zero",
+        "rationale": "Reviewed candidate.",
+        "test_sha256": digest,
+    }
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [case],
+        schema_version=2,
+    )
+
+    plan = load_evidence_plan(path, issue_text=ISSUE)
+
+    assert plan.schema_version == 2
+    assert plan.cases[0].declared_source_sha256 == digest
+    assert plan.cases[0].to_dict()["test_sha256"] == digest
+
+    candidate.write_bytes(b"def test_zero():\n    assert False\n")
+    with pytest.raises(PlanError, match="test file hash mismatch"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
+def test_live_candidate_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.py"
+    os.mkfifo(candidate)
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "candidate.py",
+                "node": "test_zero",
+            }
+        ],
+    )
+
+    started = time.perf_counter()
+    with pytest.raises(PlanError, match="not a regular file"):
+        load_evidence_plan(path, issue_text=ISSUE)
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize("live_entry", ["symlink", "fifo"])
+def test_frozen_candidate_map_never_reopens_live_symlink_or_fifo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_entry: str,
+) -> None:
+    if live_entry == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable on this platform")
+    source = b"def test_zero():\n    assert True\n"
+    digest = hashlib.sha256(source).hexdigest()
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "candidate.py",
+                "node": "test_zero",
+                "test_sha256": digest,
+            }
+        ],
+        schema_version=2,
+    )
+    plan_document = path.read_bytes()
+    candidate = tmp_path / "candidate.py"
+    if live_entry == "symlink":
+        external = tmp_path / "external.py"
+        external.write_bytes(b"this is not the reviewed candidate\n")
+        candidate.symlink_to(external)
+    else:
+        os.mkfifo(candidate)
+
+    def forbid_plain_read(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("frozen candidate bytes must not be reopened")
+
+    monkeypatch.setattr(plan_module, "_read_bounded_bytes", forbid_plain_read)
+
+    loaded = load_evidence_plan(
+        path,
+        issue_text=ISSUE,
+        document_bytes=plan_document,
+        candidate_source_documents={"candidate.py": source},
+    )
+
+    assert loaded.cases[0].source_bytes == source
+    assert loaded.cases[0].source_file == candidate
+
+
+def test_frozen_candidate_map_must_exactly_cover_plan(tmp_path: Path) -> None:
+    source = b"def test_zero():\n    assert True\n"
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "candidate.py",
+                "node": "test_zero",
+                "test_sha256": hashlib.sha256(source).hexdigest(),
+            }
+        ],
+        schema_version=2,
+    )
+    document = path.read_bytes()
+
+    with pytest.raises(PlanError, match="missing from the frozen"):
+        load_evidence_plan(
+            path,
+            issue_text=ISSUE,
+            document_bytes=document,
+            candidate_source_documents={},
+        )
+    with pytest.raises(PlanError, match="unreferenced path"):
+        load_evidence_plan(
+            path,
+            issue_text=ISSUE,
+            document_bytes=document,
+            candidate_source_documents={
+                "candidate.py": source,
+                "extra.py": source,
+            },
+        )
+
+
+def test_evidence_plan_version_controls_test_hash_field(tmp_path: Path) -> None:
+    source = b"def test_zero():\n    assert True\n"
+    (tmp_path / "candidate.py").write_bytes(source)
+    base_case = {
+        "id": "CASE-1",
+        "requirement_id": "REQ-1",
+        "test_file": "candidate.py",
+        "node": "test_zero",
+    }
+    v2_path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [base_case],
+        schema_version=2,
+    )
+    with pytest.raises(PlanError, match="test_sha256 must be a string"):
+        load_evidence_plan(v2_path, issue_text=ISSUE)
+
+    v1_case = {
+        **base_case,
+        "test_sha256": hashlib.sha256(source).hexdigest(),
+    }
+    v1_path = write_plan(tmp_path, [explicit_requirement()], [v1_case])
+    with pytest.raises(PlanError, match="unknown fields.*test_sha256"):
+        load_evidence_plan(v1_path, issue_text=ISSUE)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.5, 0, 3, "2"])
+def test_evidence_plan_rejects_invalid_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    source = b"def test_zero():\n    assert True\n"
+    (tmp_path / "candidate.py").write_bytes(source)
+    path = tmp_path / "evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "requirements": [explicit_requirement()],
+                "cases": [
+                    {
+                        "id": "CASE-1",
+                        "requirement_id": "REQ-1",
+                        "test_file": "candidate.py",
+                        "node": "test_zero",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlanError, match="schema_version must be 1 or 2"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
+@pytest.mark.parametrize("schema_version", [1.0, 2.0])
+def test_evidence_plan_accepts_json_schema_integral_versions(
+    tmp_path: Path,
+    schema_version: float,
+) -> None:
+    source = b"def test_zero():\n    assert True\n"
+    (tmp_path / "candidate.py").write_bytes(source)
+    case = {
+        "id": "CASE-1",
+        "requirement_id": "REQ-1",
+        "test_file": "candidate.py",
+        "node": "test_zero",
+    }
+    if schema_version == 2.0:
+        case["test_sha256"] = hashlib.sha256(source).hexdigest()
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [case],
+        schema_version=schema_version,  # type: ignore[arg-type]
+    )
+
+    loaded = load_evidence_plan(path, issue_text=ISSUE)
+
+    assert loaded.schema_version == int(schema_version)
+    assert type(loaded.schema_version) is int
+
+
+def test_evidence_plan_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.json"
+    path.write_bytes(
+        b'{"schema_version":1,"schema_version":2,"requirements":[],"cases":[]}'
+    )
+
+    with pytest.raises(PlanError, match="duplicate JSON object key 'schema_version'"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
+def test_evidence_plan_wraps_pathological_json_nesting(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.json"
+    path.write_bytes(b"[" * 10_000 + b"]" * 10_000)
+
+    with pytest.raises(PlanError, match="not safely parseable JSON"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
 def test_candidate_bytes_are_read_once_and_frozen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -354,13 +658,20 @@ def test_candidate_bytes_are_read_once_and_frozen(
     candidate_reads = 0
 
     def counted_bounded_read(
-        file_path: Path, *, max_bytes: int, label: str
+        file_path: Path,
+        *,
+        max_bytes: int,
+        label: str,
+        root: Path | None = None,
     ) -> bytes:
         nonlocal candidate_reads
         if file_path == candidate:
             candidate_reads += 1
         return original_bounded_read(
-            file_path, max_bytes=max_bytes, label=label
+            file_path,
+            max_bytes=max_bytes,
+            label=label,
+            root=root,
         )
 
     monkeypatch.setattr(plan_module, "_read_bounded_bytes", counted_bounded_read)
@@ -424,6 +735,68 @@ def test_rejects_two_requirements_mapped_to_the_same_pytest_node(
                 "id": "CASE-2",
                 "requirement_id": "REQ-2",
                 "test_file": "candidate.py",
+                "node": "test_x",
+            },
+        ],
+    )
+
+    with pytest.raises(PlanError, match="same pytest node"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
+def test_rejects_casefolded_aliases_for_the_same_pytest_node(
+    tmp_path: Path,
+) -> None:
+    source = "def test_x():\n    assert True\n"
+    (tmp_path / "candidate.py").write_text(source, encoding="utf-8")
+    (tmp_path / "CANDIDATE.py").write_text(source, encoding="utf-8")
+    second = explicit_requirement()
+    second["id"] = "REQ-2"
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement(), second],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "candidate.py",
+                "node": "test_x",
+            },
+            {
+                "id": "CASE-2",
+                "requirement_id": "REQ-2",
+                "test_file": "CANDIDATE.py",
+                "node": "test_x",
+            },
+        ],
+    )
+
+    with pytest.raises(PlanError, match="same pytest node"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
+def test_rejects_unicode_normalization_aliases_for_the_same_pytest_node(
+    tmp_path: Path,
+) -> None:
+    source = "def test_x():\n    assert True\n"
+    (tmp_path / "café.py").write_text(source, encoding="utf-8")
+    (tmp_path / "café.py").write_text(source, encoding="utf-8")
+    second = explicit_requirement()
+    second["id"] = "REQ-2"
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement(), second],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "café.py",
+                "node": "test_x",
+            },
+            {
+                "id": "CASE-2",
+                "requirement_id": "REQ-2",
+                "test_file": "café.py",
                 "node": "test_x",
             },
         ],
@@ -632,6 +1005,24 @@ def test_rejects_candidate_outside_plan_directory(tmp_path: Path) -> None:
         load_evidence_plan(path, issue_text=ISSUE)
 
 
+def test_rejects_nul_in_candidate_path_as_plan_error(tmp_path: Path) -> None:
+    path = write_plan(
+        tmp_path,
+        [explicit_requirement()],
+        [
+            {
+                "id": "CASE-1",
+                "requirement_id": "REQ-1",
+                "test_file": "bad\x00.py",
+                "node": "test_x",
+            }
+        ],
+    )
+
+    with pytest.raises(PlanError, match="cannot read.*embedded null"):
+        load_evidence_plan(path, issue_text=ISSUE)
+
+
 def test_rejects_unknown_fields_and_coerced_values(tmp_path: Path) -> None:
     (tmp_path / "candidate.py").write_text(
         "def test_x():\n    assert True\n", encoding="utf-8"
@@ -793,8 +1184,45 @@ def test_published_plan_limits_match_runtime() -> None:
         / "evidence-plan.schema.json"
     )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
     assert schema["properties"]["requirements"]["maxItems"] == 200
     assert schema["properties"]["cases"]["maxItems"] == 50
+
+    candidate = {
+        "id": "CASE-1",
+        "requirement_id": "REQ-1",
+        "test_file": "candidate.py",
+        "node": "test_zero",
+    }
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid(
+        {
+            "schema_version": 1,
+            "requirements": [explicit_requirement()],
+            "cases": [candidate],
+        }
+    )
+    assert validator.is_valid(
+        {
+            "schema_version": 2,
+            "requirements": [explicit_requirement()],
+            "cases": [{**candidate, "test_sha256": "0" * 64}],
+        }
+    )
+    assert not validator.is_valid(
+        {
+            "schema_version": 2,
+            "requirements": [explicit_requirement()],
+            "cases": [candidate],
+        }
+    )
+    assert not validator.is_valid(
+        {
+            "schema_version": 2,
+            "requirements": [explicit_requirement()],
+            "cases": [{**candidate, "test_sha256": "0" * 64 + "\n"}],
+        }
+    )
 
 
 def test_accepts_maximum_requirement_and_case_counts(tmp_path: Path) -> None:

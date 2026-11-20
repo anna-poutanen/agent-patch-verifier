@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:agent-patch-verifier:reviewed-requirements:1",
+  "$id": "urn:agent-patch-verifier:reviewed-requirements:2",
   "title": "Agent Patch Verifier reviewed requirements",
   "type": "object",
   "additionalProperties": false,
@@ -13,16 +13,29 @@
     "audit"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"type": "integer", "enum": [1, 2]},
     "artifact_type": {"const": "reviewed-requirements"},
     "draft": {"$ref": "#/$defs/draft_binding"},
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "source"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "source": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "\\S"
+        }
+      }
+    },
     "review": {
       "type": "object",
       "additionalProperties": false,
       "required": ["sha256", "schema_version"],
       "properties": {
         "sha256": {"$ref": "#/$defs/sha256"},
-        "schema_version": {"const": 1}
+        "schema_version": {"type": "integer", "const": 1}
       }
     },
     "requirements": {
@@ -82,9 +95,27 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"type": "integer", "const": 1}},
+        "required": ["schema_version"]
+      },
+      "then": {"not": {"required": ["issue"]}}
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"type": "integer", "const": 2}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["issue"]}
+    }
+  ],
   "$defs": {
     "sha256": {
       "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
       "pattern": "^[0-9a-f]{64}$"
     },
     "candidate_id": {
@@ -101,7 +132,7 @@
       "required": ["sha256", "schema_version", "candidate_count"],
       "properties": {
         "sha256": {"$ref": "#/$defs/sha256"},
-        "schema_version": {"const": 1},
+        "schema_version": {"type": "integer", "const": 1},
         "candidate_count": {
           "type": "integer",
           "minimum": 0,

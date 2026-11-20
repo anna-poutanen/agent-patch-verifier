@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,60 @@ def git(repository: Path, *arguments: str) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (
+            "A_A_A.A_A_A_A-A.A_A_A.A-A",
+            "A_A.A_A_A-A-A-A_A-A_A.A-A",
+        ),
+        ("AbCDefgHijKlMNopqrst", "AbCdEFGhIJKlMnopQrst"),
+    ],
+)
+def test_generated_test_path_collisions_fail_before_execution(
+    first: str,
+    second: str,
+) -> None:
+
+    first_path = verifier_module._generated_test_relative_path(
+        "20261120T120000Z-deadbeef", first
+    )
+    second_path = verifier_module._generated_test_relative_path(
+        "20261120T120000Z-deadbeef", second
+    )
+
+    assert first_path.as_posix().casefold() == second_path.as_posix().casefold()
+    with pytest.raises(VerificationError, match="generated test name collision"):
+        verifier_module._require_unique_generated_test_paths(
+            "20261120T120000Z-deadbeef",
+            (SimpleNamespace(id=first), SimpleNamespace(id=second)),
+        )
+
+
+def test_bundle_publication_never_replaces_an_existing_empty_directory(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+
+    with pytest.raises(FileExistsError):
+        verifier_module._write_bundle(
+            output,
+            manifest_bytes=b"{}\n",
+            patch_bytes=b"patch\n",
+            issue_bytes=b"issue\n",
+            evidence_plan_bytes=b"{}\n",
+            results_bytes=b"{}\n",
+            frozen_tests={},
+            cases=(),
+            context_bytes=b"{}\n",
+            report_bytes=b"report\n",
+        )
+
+    assert output.is_dir()
+    assert list(output.iterdir()) == []
 
 
 def make_target(
@@ -68,7 +123,11 @@ def make_target(
     return repository, patch
 
 
-def write_inputs(tmp_path: Path) -> tuple[Path, Path]:
+def write_inputs(
+    tmp_path: Path,
+    *,
+    schema_version: int = 1,
+) -> tuple[Path, Path]:
     issue = tmp_path / "issue.md"
     issue.write_bytes(
         b"Explicit zero must return zero. "
@@ -128,10 +187,18 @@ def write_inputs(tmp_path: Path) -> tuple[Path, Path]:
             "node": "test_missing",
         },
     ]
+    if schema_version == 2:
+        candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        for case in cases:
+            case["test_sha256"] = candidate_sha256
     evidence = tmp_path / "evidence.json"
     evidence.write_text(
         json.dumps(
-            {"schema_version": 1, "requirements": requirements, "cases": cases}
+            {
+                "schema_version": schema_version,
+                "requirements": requirements,
+                "cases": cases,
+            }
         ),
         encoding="utf-8",
     )
@@ -413,6 +480,24 @@ def test_local_and_bundle_reads_stop_at_the_byte_limit(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
+def test_local_and_bundle_reads_reject_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "artifact"
+    os.mkfifo(fifo)
+
+    started = time.perf_counter()
+    with pytest.raises(VerificationError, match="not a regular file"):
+        verifier_module._read_bytes(fifo, "test artifact", max_bytes=100)
+    with pytest.raises(VerificationError, match="not a regular file"):
+        verifier_module._read_bundle_bytes(
+            fifo,
+            tmp_path,
+            "test artifact",
+            max_bytes=100,
+        )
+    assert time.perf_counter() - started < 1.0
+
+
 @pytest.mark.parametrize("label", ["results", "report", "manifest"])
 def test_generated_documents_have_a_hard_byte_limit(label: str) -> None:
     with pytest.raises(
@@ -467,7 +552,7 @@ def test_end_to_end_finds_overfitted_zero_patch(tmp_path: Path) -> None:
         tmp_path,
         proposed_return='"""Patched-only context."""\n    return 0',
     )
-    issue, evidence = write_inputs(tmp_path)
+    issue, evidence = write_inputs(tmp_path, schema_version=2)
     issue_excerpt = (
         "Explicit zero must return zero. ``` <img id=excerpt src=x onerror=bad()>\n"
         "# forged excerpt heading\n"
@@ -575,6 +660,13 @@ def test_end_to_end_finds_overfitted_zero_patch(tmp_path: Path) -> None:
     bundled_plan = json.loads(
         (output / "evidence-plan.json").read_text(encoding="utf-8")
     )
+    assert bundled_plan["schema_version"] == 2
+    assert all(
+        case["test_sha256"] == manifest_case["test_sha256"]
+        for case, manifest_case in zip(
+            bundled_plan["cases"], manifest["cases"]
+        )
+    )
     assert bundled_plan["cases"][0]["test_file"].startswith("tests/test_")
 
     replay_artifacts = (
@@ -583,20 +675,33 @@ def test_end_to_end_finds_overfitted_zero_patch(tmp_path: Path) -> None:
         ("evidence-plan.json", "evidence plan"),
         (bundled_plan["cases"][0]["test_file"], "bundled test"),
     )
-    for index, (relative, label) in enumerate(replay_artifacts):
-        swap_request = request_from_bundle(
-            output,
-            output_directory=tmp_path / f"replay-swap-{index}",
-        )
-        artifact = output / relative
-        original = artifact.read_bytes()
-        artifact.write_bytes(original + b"\n# swapped after validation\n")
-        try:
-            with pytest.raises(VerificationError, match="hash mismatch"):
-                verify(swap_request)
-        finally:
-            artifact.write_bytes(original)
-        assert not swap_request.output_directory.exists(), label
+    swap_request = request_from_bundle(
+        output,
+        output_directory=tmp_path / "replay-swap",
+    )
+    saved_artifacts = {
+        relative: (output / relative).read_bytes()
+        for relative, _label in replay_artifacts
+    }
+    try:
+        for relative, _label in replay_artifacts:
+            artifact = output / relative
+            artifact.unlink()
+            if hasattr(os, "mkfifo"):
+                os.mkfifo(artifact)
+            else:
+                artifact.symlink_to(tmp_path / "missing-after-authentication")
+        frozen_replay = verify(swap_request)
+    finally:
+        for relative, _label in replay_artifacts:
+            artifact = output / relative
+            artifact.unlink(missing_ok=True)
+            artifact.write_bytes(saved_artifacts[relative])
+    assert [item.kind for item in frozen_replay.findings] == [
+        FindingKind.CRITERION_PASSES,
+        FindingKind.SUPPORTED_REGRESSION,
+        FindingKind.SUPPORTED_REGRESSION,
+    ]
 
     reproduced_output = tmp_path / "reproduced"
     reproduced = verify(

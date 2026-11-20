@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.0 — 2026-11-20
+
+- Add explicit accept, edit, and reject review for generated test proposals.
+  Review preparation and finalization bind the exact proposal artifact,
+  reviewed requirements, issue, generator response, and human decision ledger;
+  edited candidates are revalidated and receive new content-derived case IDs.
+- Add deterministic, no-overwrite materialization of accepted tests into an
+  inert staging directory containing exact candidate bytes, the issue, a
+  reviewed-proposal audit artifact, an EvidencePlan v2, and a completion
+  manifest written last.
+- Add `apv prepare-test-review`, `apv finalize-test-review`, and
+  `apv materialize-reviewed-tests`. These commands statically parse candidate
+  source but never import, collect, or execute it.
+- Add `apv verify-materialized` as the separate, explicit execution handoff.
+  It authenticates the complete staging inventory and cross-checks every
+  manifest, review, plan, issue, and candidate hash, then carries frozen issue,
+  plan, and candidate bytes into the existing base-versus-patched verifier
+  without reopening staging paths.
+- Freeze authenticated patch, issue, EvidencePlan, and candidate bytes across
+  bundle replay handoff, and use bounded descriptor-relative, non-blocking,
+  no-follow reads for direct verification inputs, bundle artifacts, plan
+  sources, and post-test JUnit reports. Unsupported platforms now fail closed;
+  secure verification and replay currently exclude Windows.
+- Add EvidencePlan v2 candidate hashes and exact issue provenance in
+  reviewed-requirements and test-proposals schema v2. Strict legacy v1 inputs
+  remain readable, but a legacy chain without the new issue binding cannot be
+  promoted through reviewed materialization.
+- Harden portable path handling, staged-file inventory checks, duplicate-key
+  and non-finite JSON rejection, candidate collision detection, and exclusive
+  publication of staging manifests and verification bundles.
+- Keep execution trust explicit: accepting a proposal does not establish that
+  it is correct or safe, staging hashes provide integrity rather than reviewer
+  identity, and verification still runs pytest with the invoking user's OS
+  permissions and no security sandbox.
+
 ## 0.5.0 — 2026-11-19
 
 - Add a provider-neutral test-proposal protocol and the

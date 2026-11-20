@@ -196,10 +196,11 @@ def test_builds_deterministic_review_only_artifact_with_exact_provenance(
     )
 
     assert first == second
+    assert first["schema_version"] == 2
     assert first["review_status"] == "requires_review"
     assert first["reviewed_requirements"] == {
         "sha256": hashlib.sha256(reviewed_document).hexdigest(),
-        "schema_version": 1,
+        "schema_version": 2,
         "requirement_count": 2,
         "requirement_ids": requirement_ids,
     }
@@ -223,6 +224,14 @@ def test_builds_deterministic_review_only_artifact_with_exact_provenance(
     assert proposal["source"]["sha256"] == hashlib.sha256(
         raw["source"].encode("utf-8")
     ).hexdigest()
+
+    floating_version = copy.deepcopy(first)
+    floating_version["schema_version"] = 2.0
+    with pytest.raises(ProposalError, match="schema_version: expected integer"):
+        validate_test_proposal_artifact(
+            floating_version,
+            reviewed_requirements_document=reviewed_document,
+        )
 
 
 def test_load_exposes_only_inert_sources_for_review_staging(
@@ -251,6 +260,66 @@ def test_load_exposes_only_inert_sources_for_review_staging(
     assert len(loaded.coverage.unproposed_requirement_ids) == 1
     assert not hasattr(loaded, "to_evidence_plan_dict")
     assert not hasattr(proposal, "to_evidence_case_dict")
+
+
+def test_legacy_v1_artifacts_remain_readable_without_claiming_v2_issue_binding(
+    reviewed_document: bytes,
+) -> None:
+    legacy_reviewed = json.loads(reviewed_document)
+    legacy_reviewed["schema_version"] = 1
+    legacy_reviewed.pop("issue")
+    legacy_reviewed_bytes = encode_review_artifact(legacy_reviewed)
+    requirement_id = _requirement_ids(legacy_reviewed_bytes)[0]
+    current = build_test_proposal_artifact(
+        legacy_reviewed_bytes,
+        generator_adapter="compatibility-test",
+        generator_model=None,
+        proposals=[_raw_proposal(requirement_id)],
+    )
+    assert current["schema_version"] == 1
+    assert current["reviewed_requirements"]["schema_version"] == 1
+
+    legacy_proposals = copy.deepcopy(current)
+    validate_test_proposal_artifact(
+        legacy_proposals,
+        reviewed_requirements_document=legacy_reviewed_bytes,
+    )
+    loaded = load_test_proposal_artifact(
+        encode_test_proposal_artifact(legacy_proposals),
+        reviewed_requirements_document=legacy_reviewed_bytes,
+    )
+    assert loaded.schema_version == 1
+
+    falsely_promoted = copy.deepcopy(legacy_proposals)
+    falsely_promoted["schema_version"] = 2
+    with pytest.raises(
+        ProposalError,
+        match="reviewed_requirements.*schema_version.*expected constant 2",
+    ):
+        validate_test_proposal_artifact(
+            falsely_promoted,
+            reviewed_requirements_document=legacy_reviewed_bytes,
+        )
+
+    # v1 predates materialization and accepted paths that are now reserved for
+    # staging metadata.  Preserve loader compatibility; v2 generation and the
+    # review/materialization boundary still reject this path.
+    legacy_reserved = copy.deepcopy(legacy_proposals)
+    proposal = legacy_reserved["proposals"][0]
+    proposal["test_file"] = "issue.md/test_zero.py"
+    proposal["id"] = proposal_module._stable_case_id(proposal)
+    canonical = proposal_module._canonical_generator_response(
+        [proposal_module._raw_proposal_from_normalized(proposal)]
+    )
+    digest = hashlib.sha256(canonical).hexdigest()
+    legacy_reserved["generator_response"].update(
+        sha256=digest,
+        canonical_sha256=digest,
+    )
+    validate_test_proposal_artifact(
+        legacy_reserved,
+        reviewed_requirements_document=legacy_reviewed_bytes,
+    )
 
 
 def test_builder_sorts_proposals_and_coverage_in_reviewed_order(
@@ -371,6 +440,14 @@ def test_exact_reviewed_bytes_cannot_be_reserialized_after_binding(
         ({"test_file": "generated/./test_x.py"}, "canonical safe relative"),
         ({"test_file": "generated./test_x.py"}, "ending in a dot"),
         ({"test_file": f"{'a' * 256}/test_x.py"}, "exceeding 255 bytes"),
+        (
+            {"test_file": "/".join(["a"] * 32 + ["test_x.py"])},
+            "at most 32 components",
+        ),
+        (
+            {"test_file": "evidence-plan.json/test_x.py"},
+            "reserved materialization root",
+        ),
         ({"rationale": " surrounded "}, "surrounding whitespace"),
         ({"rationale": "\ud800"}, "unpaired Unicode surrogates"),
         ({"source": "\ud800"}, "unpaired Unicode surrogates"),
@@ -457,6 +534,69 @@ def test_builder_rejects_casefolded_portable_path_collisions(
     )
 
     with pytest.raises(ProposalError, match="portable path collision"):
+        build_test_proposal_artifact(
+            reviewed_document,
+            generator_adapter="manual",
+            generator_model=None,
+            proposals=[first, second],
+        )
+
+
+@pytest.mark.parametrize(
+    ("first_path", "second_path", "match"),
+    [
+        (
+            "generated/test_case.py",
+            "generated/test_case.py/nested.py",
+            "file/directory path conflict",
+        ),
+        (
+            "Generated/test_first.py",
+            "generated/test_second.py",
+            "directory spelling collision",
+        ),
+    ],
+)
+def test_builder_rejects_nonportable_path_tree_conflicts(
+    reviewed_document: bytes,
+    first_path: str,
+    second_path: str,
+    match: str,
+) -> None:
+    requirement_id = _requirement_ids(reviewed_document)[0]
+    first = _raw_proposal(requirement_id, test_file=first_path)
+    second = _raw_proposal(
+        requirement_id,
+        category="caller_level",
+        test_file=second_path,
+    )
+
+    with pytest.raises(ProposalError, match=match):
+        build_test_proposal_artifact(
+            reviewed_document,
+            generator_adapter="manual",
+            generator_model=None,
+            proposals=[first, second],
+        )
+
+
+def test_builder_bounds_unique_candidate_directories(
+    reviewed_document: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(proposal_module, "_MAX_UNIQUE_DIRECTORIES", 1)
+    requirement_id = _requirement_ids(reviewed_document)[0]
+    first = _raw_proposal(
+        requirement_id,
+        test_file="first/test_case.py",
+    )
+    second = _raw_proposal(
+        requirement_id,
+        category="caller_level",
+        test_file="second/test_case.py",
+    )
+
+    with pytest.raises(ProposalError, match="1-directory limit"):
         build_test_proposal_artifact(
             reviewed_document,
             generator_adapter="manual",
