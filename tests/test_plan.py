@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 import patch_verifier.plan as plan_module
-from patch_verifier.plan import PlanError, load_evidence_plan, verify_base_sources
+from patch_verifier.plan import (
+    CandidateSourceValidation,
+    PlanError,
+    load_evidence_plan,
+    validate_candidate_test_source,
+    verify_base_sources,
+)
 
 
 ISSUE = "Explicit zero must return zero. Existing non-missing values remain unchanged."
@@ -56,6 +62,239 @@ def preexisting_requirement(
         "source": source,
         "excerpt": excerpt,
     }
+
+
+def test_validates_inline_candidate_and_returns_exact_assertion_evidence() -> None:
+    source = (
+        "class TestResolver:\n"
+        "    def test_value(self):\n"
+        "        label = 'café'\n"
+        "        assert (\n"
+        "            resolve(label) == 3\n"
+        "        ), 'preserved'  # outside the AST assertion span\n"
+    ).encode("utf-8")
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-INLINE",
+        node="TestResolver::test_value",
+        source_name="model-response:test_value",
+    )
+
+    excerpt = (
+        "assert (\n"
+        "            resolve(label) == 3\n"
+        "        ), 'preserved'"
+    )
+    assert isinstance(result, CandidateSourceValidation)
+    assert result.source_sha256 == hashlib.sha256(source).hexdigest()
+    assert result.assertion_start_line == 4
+    assert result.assertion_end_line == 6
+    assert result.assertion_start_column == 8
+    assert result.assertion_excerpt == excerpt
+    assert result.assertion_sha256 == hashlib.sha256(
+        excerpt.encode("utf-8")
+    ).hexdigest()
+    assert result.python_assertion_count == 1
+
+
+def test_inline_assertion_span_uses_utf8_byte_columns() -> None:
+    source = "def test_value():\n    label='é'; assert label\n".encode("utf-8")
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-UTF8",
+        node="test_value",
+    )
+
+    assert result.assertion_start_column == 16
+    assert result.assertion_end_column == 28
+    assert result.assertion_excerpt == "assert label"
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"])
+def test_inline_assertion_span_preserves_supported_newlines(newline: bytes) -> None:
+    source = newline.join(
+        (
+            b"def test_value():",
+            b"    assert (",
+            b"        True",
+            b"    )",
+            b"",
+        )
+    )
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-NEWLINES",
+        node="test_value",
+    )
+
+    assert result.assertion_excerpt.encode("utf-8") == newline.join(
+        (b"assert (", b"        True", b"    )")
+    )
+
+
+def test_inline_validator_does_not_split_newline_heavy_bounded_source() -> None:
+    class NoSplitlinesBytes(bytes):
+        def splitlines(  # type: ignore[override]
+            self,
+            keepends: bool = False,
+        ) -> list[bytes]:
+            raise AssertionError("candidate extraction must scan without splitting")
+
+    suffix = b"def test_value():\n    assert True\n"
+    source = NoSplitlinesBytes(
+        b"\n" * (plan_module._MAX_CANDIDATE_FILE_BYTES - len(suffix)) + suffix
+    )
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-MANY-LINES",
+        node="test_value",
+    )
+
+    assert len(source) == plan_module._MAX_CANDIDATE_FILE_BYTES
+    assert result.assertion_excerpt == "assert True"
+
+
+def test_inline_validator_ignores_assertions_in_nested_scopes() -> None:
+    source = (
+        b"def test_value():\n"
+        b"    def helper():\n"
+        b"        assert False\n"
+        b"    assert True\n"
+    )
+
+    result = validate_candidate_test_source(
+        source,
+        case_id="CASE-NESTED",
+        node="test_value",
+    )
+
+    assert result.assertion_excerpt == "assert True"
+    assert result.python_assertion_count == 2
+
+
+@pytest.mark.parametrize(
+    ("source", "node", "message"),
+    [
+        (b"def test_value(:\n    assert True\n", "test_value", "parseable Python"),
+        (b"def test_value():\n    pass\n", "test_value", "found 0"),
+        (
+            b"def test_value():\n    assert True\n    assert False\n",
+            "test_value",
+            "found 2",
+        ),
+        (
+            b"def test_value():\n    assert True\n",
+            "test_value[0]",
+            "invalid pytest node",
+        ),
+        (b"def other():\n    assert True\n", "test_value", "not found uniquely"),
+        (
+            b"def test_value():\n    assert True\ndef test_value():\n    assert True\n",
+            "test_value",
+            "not found uniquely",
+        ),
+    ],
+)
+def test_inline_validator_rejects_invalid_structures(
+    source: bytes,
+    node: str,
+    message: str,
+) -> None:
+    with pytest.raises(PlanError, match=message):
+        validate_candidate_test_source(
+            source,
+            case_id="CASE-INVALID",
+            node=node,
+        )
+
+
+def test_inline_validator_requires_exact_bounded_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(PlanError, match="exact bytes"):
+        validate_candidate_test_source(  # type: ignore[arg-type]
+            "def test_value():\n    assert True\n",
+            case_id="CASE-TEXT",
+            node="test_value",
+        )
+
+    monkeypatch.setattr(plan_module, "_MAX_CANDIDATE_FILE_BYTES", 8)
+    with pytest.raises(PlanError, match="8-byte limit"):
+        validate_candidate_test_source(
+            b"def test_value():\n    assert True\n",
+            case_id="CASE-LARGE",
+            node="test_value",
+        )
+
+
+def test_inline_validator_translates_parser_resource_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_parse(source: str, *, filename: str) -> None:
+        raise RecursionError
+
+    monkeypatch.setattr(plan_module.ast, "parse", fail_parse)
+
+    with pytest.raises(PlanError, match="RecursionError"):
+        validate_candidate_test_source(
+            b"def test_value():\n    assert True\n",
+            case_id="CASE-DEEP",
+            node="test_value",
+        )
+
+
+def test_evidence_plan_uses_public_candidate_source_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = b"def test_zero():\n    assert True\n"
+    candidate = tmp_path / "candidate.py"
+    candidate.write_bytes(source)
+    observed: list[tuple[bytes, str, str, str]] = []
+    original = plan_module.validate_candidate_test_source
+
+    def record_validation(
+        source_bytes: bytes,
+        *,
+        case_id: str,
+        node: str,
+        source_name: str = "<inline candidate>",
+    ) -> CandidateSourceValidation:
+        observed.append((source_bytes, case_id, node, source_name))
+        return original(
+            source_bytes,
+            case_id=case_id,
+            node=node,
+            source_name=source_name,
+        )
+
+    monkeypatch.setattr(
+        plan_module,
+        "validate_candidate_test_source",
+        record_validation,
+    )
+
+    load_evidence_plan(
+        write_plan(
+            tmp_path,
+            [explicit_requirement()],
+            [
+                {
+                    "id": "CASE-1",
+                    "requirement_id": "REQ-1",
+                    "test_file": "candidate.py",
+                    "node": "test_zero",
+                }
+            ],
+        ),
+        issue_text=ISSUE,
+    )
+
+    assert observed == [(source, "CASE-1", "test_zero", str(candidate))]
 
 
 def test_loads_requirement_linked_case(tmp_path: Path) -> None:

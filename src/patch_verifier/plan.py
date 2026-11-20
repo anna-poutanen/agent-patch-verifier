@@ -60,6 +60,29 @@ class CandidateCase:
 
 
 @dataclass(frozen=True)
+class CandidateSourceValidation:
+    """Structural evidence from a validated in-memory candidate test.
+
+    Line numbers are one-based and columns are UTF-8 byte offsets, matching
+    Python's AST coordinates.  ``assertion_excerpt`` is the exact source text
+    covered by those coordinates; it excludes indentation before ``assert``
+    and any trailing comment or newline outside the assertion node.
+    ``python_assertion_count`` covers the whole module, including assertions
+    in unselected and nested scopes, so stricter callers can require that the
+    selected assertion is the only assertion shipped in the source.
+    """
+
+    source_sha256: str
+    assertion_start_line: int
+    assertion_end_line: int
+    assertion_start_column: int
+    assertion_end_column: int
+    assertion_excerpt: str
+    assertion_sha256: str
+    python_assertion_count: int
+
+
+@dataclass(frozen=True)
 class EvidencePlan:
     schema_version: int
     requirements: tuple[Requirement, ...]
@@ -318,7 +341,12 @@ def _case(
                 f"{_MAX_TOTAL_CANDIDATE_BYTES}-byte aggregate limit"
             )
         source_cache[source_file] = source_bytes
-    _verify_single_assertion(case_id, source_file, node, source_bytes)
+    validate_candidate_test_source(
+        source_bytes,
+        case_id=case_id,
+        node=node,
+        source_name=str(source_file),
+    )
     return CandidateCase(
         case_id,
         requirement_id,
@@ -363,19 +391,49 @@ def _require_unique_case_nodes(cases: tuple[CandidateCase, ...]) -> None:
         seen[key] = case.id
 
 
-def _verify_single_assertion(
-    case_id: str,
-    source_file: Path,
-    node: str,
+def validate_candidate_test_source(
     source_bytes: bytes,
-) -> None:
-    """Keep one candidate node attributable to one explicit assertion."""
+    *,
+    case_id: str,
+    node: str,
+    source_name: str = "<inline candidate>",
+) -> CandidateSourceValidation:
+    """Validate one candidate test from frozen bytes without executing it.
+
+    The helper performs no filesystem access, imports, pytest collection, or
+    target-code execution.  It applies the same structural contract used by
+    :func:`load_evidence_plan`: the named function must occur uniquely and
+    contain exactly one Python ``assert`` outside nested scopes.
+
+    ``source_bytes`` must be the exact bytes a caller will later persist or
+    execute.  The fixed candidate-file limit is enforced here as well as at
+    evidence-plan file-read boundaries so an in-memory caller cannot bypass
+    the parser's resource budget.
+    """
+
+    if not isinstance(source_bytes, bytes):
+        raise PlanError("candidate test source must be supplied as exact bytes")
+    if len(source_bytes) > _MAX_CANDIDATE_FILE_BYTES:
+        raise PlanError(
+            "candidate test source exceeds the "
+            f"{_MAX_CANDIDATE_FILE_BYTES}-byte limit"
+        )
+    if not isinstance(case_id, str) or not case_id.strip():
+        raise PlanError("candidate test case_id must be a non-empty string")
+    if not isinstance(node, str) or not _NODE_RE.fullmatch(node):
+        raise PlanError(f"case {case_id!r} has an invalid pytest node {node!r}")
+    if not isinstance(source_name, str) or not source_name:
+        raise PlanError("candidate test source_name must be a non-empty string")
 
     try:
         source = source_bytes.decode("utf-8")
-        tree = ast.parse(source, filename=str(source_file))
-    except (UnicodeError, SyntaxError) as exc:
-        raise PlanError(f"case {case_id!r} test file is not valid Python: {exc}") from exc
+        tree = ast.parse(source, filename=source_name)
+    except (MemoryError, RecursionError, UnicodeError, SyntaxError, ValueError) as exc:
+        detail = str(exc) or type(exc).__name__
+        raise PlanError(
+            f"case {case_id!r} test source is not safely parseable Python: "
+            f"{detail}"
+        ) from exc
 
     scope: ast.AST = tree
     parts = node.split("::")
@@ -394,7 +452,7 @@ def _verify_single_assertion(
         if len(matches) != 1:
             raise PlanError(
                 f"case {case_id!r} node {node!r} was not found uniquely in "
-                f"{source_file.name}"
+                f"{source_name}"
             )
         scope = matches[0]
 
@@ -405,35 +463,141 @@ def _verify_single_assertion(
             f"case {case_id!r} must contain exactly one Python assert statement; "
             f"found {len(assertions)}"
         )
+    assertion = assertions[0]
+    assertion_bytes = _ast_source_bytes(source_bytes, assertion)
+    try:
+        assertion_excerpt = assertion_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:  # pragma: no cover - AST uses UTF-8 boundaries
+        raise PlanError(
+            f"case {case_id!r} assertion span is not valid UTF-8"
+        ) from exc
+    assert assertion.end_lineno is not None
+    assert assertion.end_col_offset is not None
+    return CandidateSourceValidation(
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        assertion_start_line=assertion.lineno,
+        assertion_end_line=assertion.end_lineno,
+        assertion_start_column=assertion.col_offset,
+        assertion_end_column=assertion.end_col_offset,
+        assertion_excerpt=assertion_excerpt,
+        assertion_sha256=hashlib.sha256(assertion_bytes).hexdigest(),
+        python_assertion_count=_python_assertion_count(tree),
+    )
 
 
 def _assertions_without_nested_scopes(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> list[ast.Assert]:
     assertions: list[ast.Assert] = []
-
-    class Visitor(ast.NodeVisitor):
-        def visit_Assert(self, node: ast.Assert) -> None:  # noqa: N802
-            assertions.append(node)
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
-            return
-
-        def visit_AsyncFunctionDef(  # noqa: N802
-            self, node: ast.AsyncFunctionDef
-        ) -> None:
-            return
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
-            return
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
-            return
-
-    visitor = Visitor()
-    for statement in function.body:
-        visitor.visit(statement)
+    stack: list[ast.AST] = list(reversed(function.body))
+    nested_scopes = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Lambda,
+    )
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Assert):
+            assertions.append(current)
+        if isinstance(current, nested_scopes):
+            continue
+        stack.extend(reversed(tuple(ast.iter_child_nodes(current))))
     return assertions
+
+
+def _python_assertion_count(tree: ast.AST) -> int:
+    """Count every Python assertion in a module without recursive walking."""
+
+    count = 0
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.Assert):
+            count += 1
+        stack.extend(ast.iter_child_nodes(current))
+    return count
+
+
+def _ast_source_bytes(source_bytes: bytes, node: ast.AST) -> bytes:
+    """Slice exact UTF-8 bytes for a node carrying complete AST positions."""
+
+    start_line = getattr(node, "lineno", None)
+    end_line = getattr(node, "end_lineno", None)
+    start_column = getattr(node, "col_offset", None)
+    end_column = getattr(node, "end_col_offset", None)
+    if not all(
+        isinstance(value, int)
+        for value in (start_line, end_line, start_column, end_column)
+    ):
+        raise PlanError("candidate assertion is missing complete source coordinates")
+    assert isinstance(start_line, int)
+    assert isinstance(end_line, int)
+    assert isinstance(start_column, int)
+    assert isinstance(end_column, int)
+
+    if not 1 <= start_line <= end_line:
+        raise PlanError("candidate assertion has invalid source coordinates")
+    bounds = _selected_line_bounds(
+        source_bytes,
+        first_line=start_line,
+        last_line=end_line,
+    )
+    if bounds is None:
+        raise PlanError("candidate assertion has invalid source coordinates")
+    first_start, first_end, last_start, last_end = bounds
+    start = first_start + start_column
+    end = last_start + end_column
+    if not (first_start <= start <= first_end and last_start <= end <= last_end):
+        raise PlanError("candidate assertion has invalid source coordinates")
+    if start > end:
+        raise PlanError("candidate assertion has invalid source coordinates")
+    return source_bytes[start:end]
+
+
+def _selected_line_bounds(
+    source_bytes: bytes,
+    *,
+    first_line: int,
+    last_line: int,
+) -> tuple[int, int, int, int] | None:
+    """Find two logical line bounds without allocating per-line objects.
+
+    Python accepts LF, CRLF, and CR newlines.  A candidate may contain millions
+    of blank lines within the byte limit, so ``splitlines`` and a complete
+    offset table would turn a bounded source into unbounded object overhead.
+    """
+
+    first_bounds: tuple[int, int] | None = None
+    last_bounds: tuple[int, int] | None = None
+    line_number = 1
+    line_start = 0
+    index = 0
+    source_length = len(source_bytes)
+    while index < source_length:
+        byte = source_bytes[index]
+        if byte not in (10, 13):
+            index += 1
+            continue
+        if line_number == first_line:
+            first_bounds = (line_start, index)
+        if line_number == last_line:
+            last_bounds = (line_start, index)
+        if first_bounds is not None and last_bounds is not None:
+            break
+        if byte == 13 and index + 1 < source_length and source_bytes[index + 1] == 10:
+            index += 1
+        index += 1
+        line_number += 1
+        line_start = index
+
+    if first_bounds is None and line_number == first_line:
+        first_bounds = (line_start, source_length)
+    if last_bounds is None and line_number == last_line:
+        last_bounds = (line_start, source_length)
+    if first_bounds is None or last_bounds is None:
+        return None
+    return (*first_bounds, *last_bounds)
 
 
 def _issue_line(source: str, requirement_id: str) -> int:

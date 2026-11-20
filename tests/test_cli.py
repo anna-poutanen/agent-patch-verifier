@@ -13,7 +13,7 @@ def test_cli_reports_package_version(
         cli.main(["--version"])
 
     assert raised.value.code == 0
-    assert capsys.readouterr().out == "apv 0.4.0\n"
+    assert capsys.readouterr().out == "apv 0.5.0\n"
 
 
 def test_cli_exits_two_when_execution_is_inconclusive(

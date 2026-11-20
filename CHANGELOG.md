@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0 — 2026-11-19
+
+- Add a provider-neutral test-proposal protocol and the
+  `apv import-test-proposals` command for importing a bounded structured
+  generator response against exact finalized reviewed-requirements bytes.
+- Normalize requested, preservation, boundary, invalid-input, caller-level,
+  and state-sequence proposals into a deterministic review artifact with
+  stable case IDs, exact source and assertion hashes, requirement previews,
+  generator-response bindings, and explicit coverage gaps.
+- Require every proposal to reference a reviewed requirement, use a safe
+  portable Python path, name a unique statically parsed test node, and contain
+  exactly one Python `assert` in the complete candidate file.
+- Keep the artifact and every proposal in `requires_review`. Proposal import
+  does not write candidate files, import generated code, invoke pytest
+  collection, execute tests, or convert proposals into an evidence plan.
+- Deliberately defer dynamic collection: unreviewed Python cannot be
+  authenticated before it may execute in the same-user local process. A later
+  milestone must define an isolated review and materialization boundary.
+- Add strict schema and semantic validation, duplicate-key rejection,
+  deterministic encoding, atomic no-overwrite output, exact-input race
+  checks, and resource limits for generator responses and proposal sources.
+
 ## 0.4.0 — 2026-11-19
 
 - License the project under Apache License 2.0 and publish SPDX license

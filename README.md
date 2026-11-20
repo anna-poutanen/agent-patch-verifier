@@ -12,7 +12,7 @@ called a supported regression only when it checks a strongly sourced
 preservation requirement. A run with no finding is not proof that the patch is
 correct.
 
-The current development release is `0.4.0`.
+The current development release is `0.5.0`.
 
 ## Current status
 
@@ -36,7 +36,11 @@ This repository contains the first deterministic vertical slice:
 - an exact-draft-bound human review ledger that requires an accept, edit, or
   reject decision with rationale for every candidate before it can emit
   reviewed requirements;
-- a reviewable requirement and candidate-test ledger;
+- provider-neutral import of structured test proposals into an exact-input-
+  bound, deterministic `requires_review` artifact with stable case IDs,
+  assertion provenance, and explicit reviewed-requirement coverage gaps;
+- a separately reviewable evidence-plan format for requirements and candidate
+  tests;
 - fresh worktrees for every case and repeat, plus shell-free pytest execution
   with timeouts and bounded output capture;
 - an import-origin guard for modules directly imported by candidate tests when
@@ -48,12 +52,13 @@ This repository contains the first deterministic vertical slice:
   and
 - hash-checked bundle reproduction with drift detection.
 
-Requirement drafting and explicit human review are available, but verification
-still consumes an evidence plan with independently reviewable pytest cases. A
-draft never becomes an oracle automatically and never runs as a test. Reviewed
-requirements supply the requirements portion of a future evidence plan; they
-do not generate assertions or execute code. Model-driven test generation
-remains future work.
+Requirement drafting, explicit human review, and provider-neutral test-proposal
+import are available, but verification still consumes an evidence plan with
+independently reviewed pytest cases. A draft never becomes an oracle
+automatically and never runs as a test. Reviewed requirements can be supplied
+to a model adapter, and APV can normalize its structured response, but every
+proposal remains `requires_review`. APV does not yet collect, execute, or
+convert those proposals into an evidence plan.
 
 ## Install for development
 
@@ -161,6 +166,67 @@ conflict metadata as an audit trail. See
 and
 [`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json)
 for the portable formats.
+
+## Import test proposals
+
+APV accepts a small provider-neutral JSON envelope from an external model or
+other generator. The response has exactly `schema_version` and `proposals` at
+the top level. Each proposal supplies six fields; APV derives the review
+marker, hashes, assertion coordinates, requirement preview, and stable case ID
+instead of trusting a generator to provide them:
+
+```json
+{
+  "schema_version": 1,
+  "proposals": [
+    {
+      "requirement_id": "req-0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",
+      "category": "requested",
+      "test_file": "generated_tests/test_defaults.py",
+      "node": "test_explicit_zero",
+      "rationale": "Exercises the reviewed explicit-zero requirement.",
+      "source": "from project.defaults import resolve\n\ndef test_explicit_zero():\n    assert resolve(0) == 0\n"
+    }
+  ]
+}
+```
+
+Replace `requirement_id` with an ID from the finalized reviewed-requirements
+artifact. `category` is one of `requested`, `preservation`, `boundary`,
+`invalid_input`, `caller_level`, or `state_sequence`. Requested and
+preservation categories must point to a requirement of the corresponding
+kind. The candidate path must be a safe, relative, portable `.py` path, every
+proposal must use a distinct path, and `node` must identify one unique function
+or class-qualified method in the supplied source. The complete candidate file
+must contain exactly one Python `assert`.
+
+Import the response without invoking its provider again:
+
+```bash
+apv import-test-proposals \
+  --reviewed reviewed-requirements.json \
+  --response generator-response.json \
+  --adapter example-adapter \
+  --model example-model \
+  --output test-proposals.json
+```
+
+The adapter and optional model are opaque audit labels, not trust signals. The
+output binds the exact reviewed-requirements and response bytes, retains the
+complete reviewed requirement beside the proposal's sole assertion, records
+covered and uncovered requirement IDs, and marks both the artifact and every
+proposal `requires_review`. See
+[`test-proposals.schema.json`](src/patch_verifier/schemas/test-proposals.schema.json)
+for the normalized artifact format.
+
+Import performs static UTF-8, Python-syntax, node, path, assertion-count, hash,
+and schema checks only. It does not write candidate files outside the JSON
+artifact, import generated modules, invoke pytest collection, execute target or
+test code, or convert proposals into an evidence plan. Dynamic collection is
+deliberately deferred: pytest collection can execute module-level Python, and
+unreviewed code cannot be authenticated before that execution in a same-user
+local process. A later milestone needs an explicit human-review and isolation
+boundary before collection or repair can be safe enough to add.
 
 ## Evidence plan
 
@@ -313,11 +379,11 @@ case count, artifact sizes, and output-capture limit fit the current safety and
 execution contract; incompatible v1 bundles fail preflight with an explicit
 error instead of running under silently different limits.
 
-The current artifact versions are independent: release `0.4.0` writes manifest
+The current artifact versions are independent: release `0.5.0` writes manifest
 schema v2 plus context, evidence-plan, requirement-draft, requirement-review,
-and reviewed-requirements schema v1 artifacts. Consumers should use each
-artifact's own `schema_version`, not the package version, for compatibility
-decisions. The packaged contracts are
+reviewed-requirements, and test-proposals schema v1 artifacts. Consumers should
+use each artifact's own `schema_version`, not the package version, for
+compatibility decisions. The packaged contracts are
 [`manifest.schema.json`](src/patch_verifier/schemas/manifest.schema.json),
 [`context.schema.json`](src/patch_verifier/schemas/context.schema.json), and
 [`evidence-plan.schema.json`](src/patch_verifier/schemas/evidence-plan.schema.json),
@@ -325,7 +391,9 @@ plus
 [`requirements-draft.schema.json`](src/patch_verifier/schemas/requirements-draft.schema.json),
 [`requirement-review.schema.json`](src/patch_verifier/schemas/requirement-review.schema.json),
 and
-[`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json).
+[`reviewed-requirements.schema.json`](src/patch_verifier/schemas/reviewed-requirements.schema.json),
+plus
+[`test-proposals.schema.json`](src/patch_verifier/schemas/test-proposals.schema.json).
 
 ## Scope and safety
 
@@ -373,6 +441,14 @@ The SHA-256 links between draft, review, and finalized output detect drift; they
 do not authenticate who authored or approved an artifact. Accepting or editing
 a requirement is a human attestation that the cited excerpt supports it, not a
 correctness conclusion established by APV.
+
+Test-proposal import accepts at most 50 proposals from a generator response of
+at most 24 MiB. Each complete source is limited to 2 MiB and all proposal
+sources together to 20 MiB; the normalized artifact is limited to 24 MiB.
+These checks bound parsing and preserve exact provenance, but static parsing
+does not establish that an assertion correctly expresses its linked
+requirement. Generated source remains untrusted and `requires_review` even
+after a successful import.
 
 Evidence bundles can contain issue text, candidate code, source excerpts,
 commands, filesystem paths, and captured test output. Review them before

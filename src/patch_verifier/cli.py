@@ -39,6 +39,12 @@ class _ReviewFinalizationResult(Protocol):
     rejected_count: int
 
 
+class _TestProposalWriteResult(Protocol):
+    output_file: Path
+    proposal_count: int
+    unproposed_requirement_count: int
+
+
 def _draft_patch_requirements(
     *,
     repository: Path,
@@ -194,6 +200,33 @@ def _finalize_requirement_review(
     return result, analysis.truncated
 
 
+def _import_test_proposals(
+    *,
+    reviewed_file: Path,
+    response_file: Path,
+    output_file: Path,
+    generator_adapter: str,
+    generator_model: str | None,
+) -> _TestProposalWriteResult:
+    """Normalize one inert provider response without importing candidate code."""
+
+    from .test_proposals import (
+        GeneratorIdentity,
+        TestProposalError,
+        write_test_proposal_artifact,
+    )
+
+    try:
+        return write_test_proposal_artifact(
+            reviewed_file,
+            response_file,
+            output_file,
+            generator=GeneratorIdentity(generator_adapter, generator_model),
+        )
+    except TestProposalError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apv",
@@ -276,6 +309,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="new reviewed-requirements path; existing files are never overwritten",
+    )
+    import_proposals_parser = subparsers.add_parser(
+        "import-test-proposals",
+        help="validate a provider-neutral, review-only test proposal response",
+    )
+    import_proposals_parser.add_argument(
+        "--reviewed",
+        type=Path,
+        required=True,
+        help="finalized reviewed-requirements JSON artifact",
+    )
+    import_proposals_parser.add_argument(
+        "--response",
+        type=Path,
+        required=True,
+        help="provider-neutral generator response JSON",
+    )
+    import_proposals_parser.add_argument(
+        "--adapter",
+        required=True,
+        help="generator adapter label recorded for audit",
+    )
+    import_proposals_parser.add_argument(
+        "--model",
+        help="optional provider model label recorded for audit",
+    )
+    import_proposals_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="new test-proposals path; existing files are never overwritten",
     )
     verify_parser = subparsers.add_parser(
         "verify", help="verify a proposed textual Git patch"
@@ -374,6 +438,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "be missing potential tension hints.",
                     file=sys.stderr,
                 )
+            return
+        if arguments.command == "import-test-proposals":
+            proposal_result = _import_test_proposals(
+                reviewed_file=arguments.reviewed,
+                response_file=arguments.response,
+                output_file=arguments.output,
+                generator_adapter=arguments.adapter,
+                generator_model=arguments.model,
+            )
+            print(f"Test proposals: {proposal_result.output_file}")
+            print(
+                f"Proposals: {proposal_result.proposal_count} "
+                "(all require explicit review)"
+            )
+            print(
+                "Reviewed requirements without a proposal: "
+                f"{proposal_result.unproposed_requirement_count}"
+            )
+            print(
+                "No candidate code was written outside the artifact, imported, "
+                "collected, or executed."
+            )
             return
         if arguments.command == "verify":
             command_prefix = tuple(shlex.split(arguments.test_command))

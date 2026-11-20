@@ -46,7 +46,7 @@ jobs:
           from importlib.resources import files
           from patch_verifier import __version__
 
-          assert __version__ == "0.4.0"
+          assert __version__ == "0.5.0"
           package_metadata = metadata("agent-patch-verifier")
           assert package_metadata["License-Expression"] == "Apache-2.0"
           assert any(
@@ -60,5 +60,7 @@ jobs:
           assert schemas.joinpath("requirements-draft.schema.json").is_file()
           assert schemas.joinpath("requirement-review.schema.json").is_file()
           assert schemas.joinpath("reviewed-requirements.schema.json").is_file()
+          assert schemas.joinpath("test-proposals.schema.json").is_file()
           PY
           apv --version
+          apv import-test-proposals --help

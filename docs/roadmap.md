@@ -60,14 +60,35 @@ whether an observed transition proves a regression.
 - Produce a reviewed requirement set whose records can be copied directly into
   an evidence plan before candidate tests are generated.
 
-## Milestone 3: model-driven candidate generation
+## Milestone 3a: review-only test proposal ingestion — complete
 
-- Define a provider-neutral generator protocol and structured response schema.
-- Generate requested, preservation, boundary, invalid-input, caller-level, and
-  state-sequence cases.
-- Validate syntax and pytest collection before dual execution.
-- Allow a small, bounded repair loop for collection and import errors.
-- Keep generated assertions constrained to accepted requirement IDs.
+- Define a provider-neutral generator protocol and a strict structured response
+  envelope for requested, preservation, boundary, invalid-input, caller-level,
+  and state-sequence proposals.
+- Bind every proposal set to the exact finalized reviewed-requirements bytes and
+  preserve the generator adapter, optional model label, exact response hash,
+  canonical response hash, and reviewed-requirement coverage.
+- Constrain every proposal to an accepted requirement ID, a safe portable
+  candidate path, a uniquely named statically parsed test node, and exactly one
+  Python `assert` in the complete candidate source.
+- Derive stable case IDs plus exact source and assertion spans and hashes rather
+  than trusting those fields from a generator.
+- Keep the artifact and every proposal in `requires_review`; importing a
+  response neither writes candidate files nor imports, collects, executes, or
+  converts generated code into an evidence plan.
+
+## Milestone 3b: reviewed materialization and isolated preflight — deferred
+
+- Define explicit human decisions for accepting, editing, or rejecting test
+  proposals without weakening their reviewed-requirement bindings.
+- Convert only accepted proposals into an evidence plan and materialize exact
+  reviewed bytes for the existing dual-execution verifier.
+- Design an isolation boundary for pytest collection and import preflight.
+  Dynamic collection is deliberately absent from Milestone 3a because
+  unreviewed Python cannot be authenticated before it may execute in a
+  same-user local process.
+- After that boundary exists, validate pytest collection and allow a small,
+  bounded repair loop for collection and import errors.
 
 ## Milestone 4: minimization and evaluation
 
